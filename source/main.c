@@ -5620,7 +5620,7 @@ int main(int argc, char **argv) {
         gfx_rect(framebuf, 0, LY_HEADER_Y, FB_WIDTH, LY_HEADER_H, C_HEADER);
 
         draw_text(framebuf, LY_PAD, 12, 24, TR("GTA V 工具箱", "GTA V Toolbox"), C_TEXT);
-        draw_text(framebuf, LY_PAD, 42, 12, "v6.3.2", C_TEXT_MUTED);   /* ★ v6.2: 原为 "v5.7" 一直没跟着版本走 */
+        draw_text(framebuf, LY_PAD, 42, 12, "v6.3.4", C_TEXT_MUTED);   /* ★ v6.2: 原为 "v5.7" 一直没跟着版本走 */
 
         /* 3. 页签（可点）-- ★ v28: hbmenu 式底边高亮条，无描边 */
         {

@@ -540,6 +540,7 @@ int gc_script_install(const char *nsc_path, const char *entry_name,
     /* 头部尺寸检查：不能侵占首个数据 */
     long long new_head_end = 16 + (long long)new_ec * 16 + new_nl;
     long long first_data = -1;
+    int first_data_idx = -1;      /* ★ v6.4: 首个数据条目的 TOC 索引（平移用） */
     for (u32 i = 0; i < new_ec; i++) {
         u64 q0 = rd_u64(new_toc + i * 16);
         int is_res = (int)((q0 >> 63) & 1);
@@ -547,15 +548,94 @@ int gc_script_install(const char *nsc_path, const char *entry_name,
         if (!is_res && off == 0x7FFFFF) continue;
         if (off == 0) continue;
         long long s = (long long)off * 512;
-        if (first_data < 0 || s < first_data) first_data = s;
+        if (first_data < 0 || s < first_data) { first_data = s; first_data_idx = (int)i; }
     }
     if (first_data >= 0 && new_head_end > first_data) {
-        if (new_names != ri.names) free(new_names);
-        if (new_toc != ri.toc) free(new_toc);
-        rel_free(&ri); free_bufs(raw, comp); fclose(f);
-        set_err(err, errsz, "头部扩容需平移数据（%lld > %lld），暂不支持",
-                new_head_end, first_data);
-        return GC_SCRIPT_ERR_SPACE;
+        /* ★ v6.4: 头区增长会侵占首个数据条目 ⇒ 平移该条目到新数据区。
+         *
+         * 背景（2026-10-07 实测）：装了多个 mod 后内层头区后的空隙耗尽
+         * （首个数据条目紧贴头区尾，只余 16B），再新增条目（TOC+16B+名字）
+         * 就会撞上。旧版直接报错"暂不支持"。
+         *
+         * 平移方案（安全，不动其他任何条目）：
+         *   1. 把首个数据条目的【全部字节】原样搬到新数据落点之后
+         *      （write_at + need 处，即新装数据之后，文件末尾方向）
+         *   2. 只改该条目 TOC 的 offset 字段指向新位置
+         *   3. 头区就能安全增长（增长量 ≤ 176B < 512B，平移一个条目必然够）
+         *
+         * 🚨 前提：write_at 是新数据落点（空隙或文件尾），平移目标在其后，
+         *    不会覆盖任何既有数据。字节原样拷贝（压缩流/加密头都不用理解）。
+         */
+        /* 首个数据条目的磁盘长度：从 TOC 拿 on_disk（压缩后大小），
+         * RSC7 资源条目 on_disk 也是实际字节数；按 512 对齐占用 */
+        u64 q0f = rd_u64(new_toc + (size_t)first_data_idx * 16);
+        u32 od_first = (u32)((q0f >> 16) & 0xFFFFFF);
+        u32 d8_first = rd_u32(new_toc + (size_t)first_data_idx * 16 + 8);
+        u32 len_first = od_first ? od_first : d8_first;
+        u32 occ_first = (len_first + 511u) & ~511u;
+        if (occ_first == 0) occ_first = 512;
+
+        /* ★ v6.3.4: 平移目标 = 文件末尾（512 对齐）。
+         * v6.3.3 的 write_at+need 落点有缺陷：write_at 落在空隙里时，
+         * 平移目标受空隙上界（gap_end）限制 —— 首个数据条目若是
+         * shop_controller 级别的大条目（800KB+），空隙装不下 ⇒ 报
+         * "平移空间不足"（2026-10-07 用户实测：空隙仅 60KB）。
+         * 文件末尾空间无限且无既有数据可撞，永远安全。 */
+        long long mv_dst = (fsz + 511) / 512 * 512;
+        long long mv_src = first_data;   /* 绝对偏移（base 已含） */
+        /* 平移目标必须在新数据之后（不覆盖刚写的新 mod 数据）；
+         * write_at 已是文件末尾方向时 mv_dst 天然 >= write_at+need */
+        if (mv_dst < write_at + (long long)need)
+            mv_dst = (write_at + (long long)need + 511) / 512 * 512;
+
+        /* 拷贝（分块，条目可能大） */
+        static const u32 CH = 64 * 1024;
+        u8 *cbuf = (u8*)malloc(CH);
+        if (!cbuf) {
+            if (new_names != ri.names) free(new_names);
+            if (new_toc != ri.toc) free(new_toc);
+            rel_free(&ri); free_bufs(raw, comp); fclose(f);
+            set_err(err, errsz, "平移缓冲分配失败");
+            return GC_SCRIPT_ERR_SPACE;
+        }
+        long long done = 0;
+        int io_ok = 1;
+        while (done < (long long)occ_first) {
+            u32 k = ((long long)occ_first - done > (long long)CH) ? CH : (u32)(occ_first - done);
+            if (fseeko(f, mv_src + done, SEEK_SET) != 0 ||
+                fread(cbuf, 1, k, f) != k ||
+                fseeko(f, mv_dst + done, SEEK_SET) != 0 ||
+                fwrite(cbuf, 1, k, f) != k) { io_ok = 0; break; }
+            done += k;
+        }
+        free(cbuf);
+        if (!io_ok) {
+            if (new_names != ri.names) free(new_names);
+            if (new_toc != ri.toc) free(new_toc);
+            rel_free(&ri); free_bufs(raw, comp); fclose(f);
+            set_err(err, errsz, "平移首个数据条目 IO 失败");
+            return GC_SCRIPT_ERR_IO;
+        }
+        /* 改该条目 TOC 偏移 → 平移后的新位置（扇区号） */
+        u32 mv_sec = (u32)(mv_dst / 512);
+        if (mv_sec > 0x7FFFFF) {
+            if (new_names != ri.names) free(new_names);
+            if (new_toc != ri.toc) free(new_toc);
+            rel_free(&ri); free_bufs(raw, comp); fclose(f);
+            set_err(err, errsz, "平移落点越界");
+            return GC_SCRIPT_ERR_SPACE;
+        }
+        u8 *pf = new_toc + (size_t)first_data_idx * 16;
+        u64 q0n = rd_u64(pf);
+        q0n = (q0n & ~(0x7FFFFFULL << 40)) | ((u64)(mv_sec & 0x7FFFFF) << 40);
+        wr_u64(pf, q0n);
+
+        printf("[script] 头区扩容 %lld > %lld：平移条目#%d (%u B) 到 %lld\n",
+               new_head_end, first_data, first_data_idx, occ_first, mv_dst);
+
+        /* script_rel 的 size 需覆盖平移后的尾部 */
+        long long mv_end = mv_dst + (long long)occ_first - base;
+        if (mv_end > (long long)new_osize) new_osize = (u32)mv_end;
     }
 
     /* 🚨 先写 names 再写 TOC */
@@ -880,7 +960,7 @@ static const GcBuiltinModDef S_MODS[] = {
       "与「经典 ragemenu」互斥（都占 ragemenu）",
       "Mutually exclusive with Classic ragemenu (both use the ragemenu slot)",
       MF_MEGATARD,  MF_N(MF_MEGATARD) },
-    { "classic",   "经典 ragemenu 简体 v13", "Classic ragemenu v13 (ZH)", "maritoguionyo",
+    { "classic",   "经典 ragemenu 简体 10月7日版", "Classic ragemenu Oct 7 (ZH)", "maritoguionyo",
       "与「MEGATARD」互斥（都占 ragemenu）",
       "Mutually exclusive with MEGATARD (both use the ragemenu slot)",
       MF_CLASSIC,   MF_N(MF_CLASSIC) },
