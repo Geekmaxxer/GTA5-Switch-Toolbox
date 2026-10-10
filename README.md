@@ -3,6 +3,9 @@
 GTA V Switch 移植版（Title ID `0100b00b51230000`）的多功能工具箱 NRO ——
 DLC 管理、脚本 MOD 安装/还原、画质预设、内置模组，一个 .nro 全搞定。
 
+
+中文 | [English](README.en.md)
+
 ## ⚠️ 使用前必读：备份 update.rpf 和 update2.rpf
 
 **强烈建议先备份**，任何 RPF 写入操作（装 mod / 卸载 mod / 还原官方 / 性能调参写入）都有小概率翻车：
