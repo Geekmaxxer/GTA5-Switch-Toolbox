@@ -4,14 +4,15 @@
   "official_app_metadata_version": "6.3.2",
   "self_radio_public_version": "1.1",
   "nro": {
-    "bytes": 6444936,
-    "sha256": "94c282327165a3b12b4a7eceaf3d67412d2c675fa8280d1983ec6d5e24fc1247",
+    "bytes": 9065900,
+    "sha256": "7e9be206a46261b31fe65776aa01deadd5bb7d9b0d146fd265f72d95883b75cb",
     "bss_bytes": 1802240
   },
   "ui_console": {
     "passed": true,
     "basis": "User confirmed UI Test 1 Joy-Con and touch both passed",
-    "date": "2026-10-14"
+    "date": "2026-10-14",
+    "tested_nro_sha256": "94c282327165a3b12b4a7eceaf3d67412d2c675fa8280d1983ec6d5e24fc1247"
   },
   "package_workflows_console": {
     "passed": false,
@@ -20,7 +21,7 @@
   "local_checks": {
     "ui_core": 623,
     "controller": 35,
-    "scripts": 30,
+    "scripts": 31,
     "packages": 25,
     "exporter": 15,
     "bilingual_preview_screens": 48
@@ -32,7 +33,6 @@
     "patched_entries": 16
   },
   "unchanged": [
-    "original romfs assets",
     "gameconfig tuning values",
     "save keys",
     "official app version metadata"
@@ -42,5 +42,27 @@
     "NSC structure checks do not prove native compatibility",
     "Radio import uses prepared matching desktop station/timing outputs",
     "Existing save/DLC/script writes remain in place"
-  ]
+  ],
+  "current_nro_console_verified": false,
+  "bundled_megatard": {
+    "version": "1.0.5",
+    "files": {
+      "ragemenu.nsc": {
+        "bytes": 736752,
+        "sha256": "3bf7fbe1ec86e855de3bd1af168953bb2474a416ae43b4d22cba5bb2a1ac9658"
+      },
+      "achievement_controller.nsc": {
+        "bytes": 81920,
+        "sha256": "717b8b19ab45b0eb47277a29ce5fafd5f6f97332449ecfb998cc175bb86afc1a"
+      },
+      "shop_controller.nsc": {
+        "bytes": 2129920,
+        "sha256": "bda3e3eee9a5136b538a15fe5a53574ec36a7995d0c818ed3248d33380e5bbc1"
+      }
+    },
+    "installer_entry_count": 3,
+    "console_install_verified": false,
+    "host_script_checks": 31
+  },
+  "release_zip_sha256": "fc0722ffc9b9dd76577dbd4cef3142b197fb901a35a698843b05a483379e706f"
 }

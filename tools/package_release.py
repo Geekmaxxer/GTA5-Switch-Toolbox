@@ -70,8 +70,11 @@ Radio Imports accepts prepared station/timing packages in
 `switch/gta5save/packages/`; prepare matching outputs with GTA Radio Editor on
 a PC. Scripts, DLC, saves and graphics tools remain available in their tabs.
 
-UI passed Switch Joy-Con and touch testing. New package installation, restoration
-and recovery have passed local checks; their Switch acceptance is still pending.
+Scripts > Builtin Mods includes MEGATARD v1.0.5 with ragemenu,
+achievement_controller and shop_controller.
+
+The UI passed earlier Switch Joy-Con and touch testing. This refreshed build's
+MEGATARD installation and package install/restore/recovery still await Switch testing.
 
 Toolbox: niceboat0. MG-Menu SDK, GTA Radio Editor and Self Radio NX: MEGATARD.
 """
@@ -98,8 +101,11 @@ Y 恢复中断的更新。需要游戏构建
 请先使用电脑上的 GTA Radio Editor 生成匹配的输出。
 原有脚本、DLC、存档及画质工具仍可从对应页签使用。
 
-界面已通过 Switch Joy-Con 和触屏测试。新增安装包的安装、还原及恢复已通过
-本地检查，仍待 Switch 实机验收。
+脚本 > 内置模组包含 MEGATARD v1.0.5，附带 ragemenu、
+achievement_controller 和 shop_controller 三个脚本。
+
+界面此前已通过 Switch Joy-Con 和触屏测试。本次更新的 MEGATARD 安装
+及安装包的安装、还原和恢复仍待 Switch 实机验收。
 
 工具箱：niceboat0。MG-Menu SDK、GTA Radio Editor、自定义电台 NX：MEGATARD。
 """
