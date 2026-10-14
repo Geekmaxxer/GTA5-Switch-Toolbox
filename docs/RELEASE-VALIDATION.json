@@ -1,0 +1,46 @@
+{
+  "date": "2026-10-14",
+  "status": "community_release",
+  "official_app_metadata_version": "6.3.2",
+  "self_radio_public_version": "1.1",
+  "nro": {
+    "bytes": 6444936,
+    "sha256": "94c282327165a3b12b4a7eceaf3d67412d2c675fa8280d1983ec6d5e24fc1247",
+    "bss_bytes": 1802240
+  },
+  "ui_console": {
+    "passed": true,
+    "basis": "User confirmed UI Test 1 Joy-Con and touch both passed",
+    "date": "2026-10-14"
+  },
+  "package_workflows_console": {
+    "passed": false,
+    "status": "pending acceptance"
+  },
+  "local_checks": {
+    "ui_core": 623,
+    "controller": 35,
+    "scripts": 30,
+    "packages": 25,
+    "exporter": 15,
+    "bilingual_preview_screens": 48
+  },
+  "real_archive_local": {
+    "install": true,
+    "repeat_install": true,
+    "byte_exact_restore": true,
+    "patched_entries": 16
+  },
+  "unchanged": [
+    "original romfs assets",
+    "gameconfig tuning values",
+    "save keys",
+    "official app version metadata"
+  ],
+  "upstream_published": false,
+  "limits": [
+    "NSC structure checks do not prove native compatibility",
+    "Radio import uses prepared matching desktop station/timing outputs",
+    "Existing save/DLC/script writes remain in place"
+  ]
+}

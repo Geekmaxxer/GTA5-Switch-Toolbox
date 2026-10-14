@@ -2,4 +2,8 @@
 *.o
 *.nro
 *.nacp
+*.elf
+*.map
+__pycache__/
+releases/
 build/

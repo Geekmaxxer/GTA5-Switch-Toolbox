@@ -17,6 +17,8 @@
 #include "gc_rpf.h"
 #include "gc_dlc.h"
 #include "gc_script.h"   /* ★ v5.0: 脚本 mod（.nsc）安装 */
+#include "gc_package.h"
+#include "gc_ui_core.h"
 #include "gc_presets.h"
 #include "lang.h"        /* ★ v6.3: 双语 TR() 宏 */
 
@@ -30,31 +32,20 @@
 /* ========================================================================= */
 /* ★ v5: 统一布局常量 -- 全部区块的 y 区间由这里定义, 杜绝魔数散落造成重叠     */
 /* ========================================================================= */
-#define LY_PAD        40                      /* 左右安全边距 */
+#define LY_PAD        32
 #define LY_HEADER_Y   0
-#define LY_HEADER_H   62
-#define LY_INFO_Y     66
-#define LY_INFO_H     42
-/* ★ v6.1 (2026-10-01): 顶部「角色标签栏」条带已废弃 —— 它只服务于已移除的
- *   「存档修改」页（渲染块已整块删除）⇒ 112..150 这 44px 永远空白。
- *   现把该条带回收给内容区：LY_BODY_Y 从 156 上提到 112，LY_BODY_H 从 420 增至 464。
- *   （LY_CTAB_* 常量已删除，无残留引用。） */
-#define LY_BODY_Y     112                     /* ★ v6.1: 156 -> 112（吸收废弃条带）*/
-#define LY_BODY_H     464                     /* ★ v6.1: 420 -> 464（+44）*/
-#define LY_BTN_Y      584                     /* 统一按钮栏 584..632 */
-#define LY_BTN_H      48
-#define LY_HINT_Y     640                     /* 提示行 640..676 */
-#define LY_BODY_BOT   (LY_BODY_Y + LY_BODY_H) /* = 576（与按钮栏仍留 8px 间隙）*/
-/* 内容区右边界 (给右侧滚动条留 22px) */
-#define LY_CONTENT_R  (FB_WIDTH - LY_PAD - 22)   /* = 1218 */
+#define LY_HEADER_H   108
+#define LY_INFO_Y     116
+#define LY_INFO_H     44
+#define LY_BODY_Y     176
+#define LY_BODY_H     384
+#define LY_BTN_Y      578
+#define LY_BTN_H      50
+#define LY_HINT_Y     640
+#define LY_BODY_BOT   (LY_BODY_Y + LY_BODY_H)
+#define LY_CONTENT_R  (FB_WIDTH - LY_PAD - 22)
 
-/* 界面主题配色 (深色典雅，无 Emoji 干净排版) */
-/* ★★★ v28e 关键修正：本工程 framebuffer = PIXEL_FORMAT_RGBA_8888，
- *   其像素 u32 的内存序是 0xAABBGGRR（R 在【低字节】，与 PC 常见的 BGRA 相反）。
- *   ⇒ 源码里所有颜色【禁止直接写 0xAARRGGBB】！
- *     必须用 RGB_A(r,g,b) 宏（内部按 #RRGGBB 习惯书写，自动转成 ABGR）。
- *   🚨 历史事故：全 UI 一直按 HTML 顺序写色值 ⇒ R/B 互换 ⇒ 主色蓝 #58A6FF
- *      被渲染成橙棕 #FFA658 ⇒ 用户连续 4 版反馈「配色还是棕色」。 */
+/* RGBA_8888 framebuffer pixels are ABGR words on the little-endian Switch. */
 #define RGB_A(r, g, b) (0xFF000000u | ((uint32_t)(b) << 16) | ((uint32_t)(g) << 8) | (uint32_t)(r))
 
 /* ★★ v28 配色体系（借鉴 hbmenu/Goldleaf/Tesla，色值均按 #RRGGBB 书写）：
@@ -174,10 +165,14 @@ typedef enum {
      *   会溢出格子（实机截图已证实），现合并为一个入口进弹窗。 */
     ACT_SCRIPT_MGR,
     ACT_SCRIPT_CONFIRM_OK,    /* ★ v6.2: 二次确认弹窗的「确认」按钮 */
+    ACT_SELF_RADIO, ACT_RADIO_IMPORTS, ACT_PACKAGE_SELECT,
+    ACT_PACKAGE_INSTALL, ACT_PACKAGE_RESTORE, ACT_PACKAGE_RECOVER,
+    ACT_UI_PAGE_UP, ACT_UI_PAGE_DOWN, ACT_UI_DECREASE, ACT_UI_INCREASE,
+    ACT_UI_ACTIONS_PREV, ACT_UI_ACTIONS_NEXT,
 } UiAction;
 
 /* ★ 手动调整列表可见行数（行高 34 ⇒ 9 行 = 306，留出提示行空间） */
-#define GC_KNOB_VIS 12
+#define GC_KNOB_VIS 8
 
 /* 可点区域 */
 #define MAX_HOTZONES 96
@@ -204,7 +199,7 @@ static u64 g_touch_last_tick = 0;            /* 上次触摸时间(防连击) */
 static int  g_tap_fx[4] = {0, 0, 0, 0};      /* x, y, w, h */
 static int  g_tap_fx_on  = 0;
 static u64  g_tap_fx_tick = 0;
-#define TAP_FX_MS 420
+#define TAP_FX_MS 180
 
 /* ★ v24: 该矩形是否就是「刚被点的那个热区」--给按钮画按下高亮用
  *   （必须在渲染里逐帧判断，不能缓存：按钮栏每帧重算位置） */
@@ -237,11 +232,14 @@ static int hot_hit(int px, int py) {
 
 /* 每帧开头读取触摸屏, 更新 g_touch_x/y 与 g_touch_tapped */
 static void touch_poll(void) {
+    static int was_down;
     g_touch_tapped = 0;
     g_touch_x = -1;
     g_touch_y = -1;
-    if (hidGetTouchScreenStates(&g_touch, 1) <= 0 || g_touch.count <= 0) {
+    if (hidGetTouchScreenStates(&g_touch, 1) <= 0)return;
+    if (g_touch.count <= 0) {
         g_touch_last_tick = 0;
+        was_down = 0;
         return;
     }
     /* 只取第一个触点 (Switch 电容屏最多 16 点, 单指足够) */
@@ -249,12 +247,11 @@ static void touch_poll(void) {
     g_touch_y = (int)g_touch.touches[0].y;
 
     /* 防连击: 距离上次触发 >= 180ms 才算「新点击」 */
-    u64 now = svcGetSystemTick();
-    u64 ms = (now - g_touch_last_tick) * 1000 / 19200000ULL;
-    if (g_touch_last_tick == 0 || ms >= 180) {
+    if (!was_down) {
         g_touch_tapped = 1;
-        g_touch_last_tick = now;
+        g_touch_last_tick = svcGetSystemTick();
     }
+    was_down = 1;
 }
 
 /* 摇杆方向 -> 方向键位（超出阈值即模拟方向键）
@@ -262,13 +259,10 @@ static void touch_poll(void) {
  * ★ v31: 参数化 -- 左摇杆(0) / 右摇杆(1) 共用；用户要求【右摇杆与左摇杆功能完全一致】 */
 #define JOY_THRESHOLD 4000
 static u32 joy_to_dpad(int idx) {
-    HidAnalogStickState st = padGetStickPos(&g_pad, idx);
-    u32 bits = 0;
-    if (st.x > JOY_THRESHOLD) bits |= HidNpadButton_Right;
-    if (st.x < -JOY_THRESHOLD) bits |= HidNpadButton_Left;
-    if (st.y > JOY_THRESHOLD) bits |= HidNpadButton_Up;
-    if (st.y < -JOY_THRESHOLD) bits |= HidNpadButton_Down;
-    return bits;
+    HidAnalogStickState st=padGetStickPos(&g_pad,idx);
+    if(abs(st.x)<10000 && abs(st.y)<10000)return 0;
+    if(abs(st.x)>abs(st.y))return st.x>0?HidNpadButton_Right:HidNpadButton_Left;
+    return st.y>0?HidNpadButton_Up:HidNpadButton_Down;
 }
 static u32        g_stride_words = 0;
 
@@ -304,149 +298,34 @@ static double sqrt_approx(double v) {
 
 /* ★ v29: 全局卡片圆角开关 -- 0 = 直角卡片（当前风格，更利落）
  *   想恢复圆角只需改成 6/8/10，所有调用点自动跟随 */
-#define CARD_R 0
+#define CARD_R 8
 
 /* ★ v28: 卡片（纯色块 + 可选圆角，无描边）
  *   r = 圆角半径；★ v29 起由 CARD_R 统一覆盖，调用点传值不再生效 */
-static void gfx_card(uint32_t *fb, int x, int y, int w, int h, uint32_t color, int r) {
-    r = CARD_R;                       /* ★ v29: 统一由开关控制 */
-    if (r <= 0) { gfx_rect(fb, x, y, w, h, color); return; }
-    if (r > h / 2) r = h / 2;
-    if (r > w / 2) r = w / 2;
-    /* 中段（不含上下圆角带） */
-    gfx_rect(fb, x, y + r, w, h - 2 * r, color);
-    /* 上/下直边段 */
-    gfx_rect(fb, x + r, y, w - 2 * r, r, color);
-    gfx_rect(fb, x + r, y + h - r, w - 2 * r, r, color);
-    /* 四角：逐行阶梯近似圆弧 */
-    for (int i = 1; i < r; i++) {
-        int inset = (int)(r - sqrt_approx((double)r * r - (double)i * i));
-        gfx_rect(fb, x + r - inset, y + r - i, inset, 1, color);            /* 左上 */
-        gfx_rect(fb, x + w - r, y + r - i, inset, 1, color);                /* 右上 */
-        gfx_rect(fb, x + r - inset, y + h - r + i - 1, inset, 1, color);    /* 左下 */
-        gfx_rect(fb, x + w - r, y + h - r + i - 1, inset, 1, color);        /* 右下 */
+static void gfx_card(uint32_t *fb,int x,int y,int w,int h,uint32_t color,int radius) {
+    if(w<=0 || h<=0)return;
+    int r=radius<0?0:radius;
+    if(r>12)r=12;
+    if(r>w/2)r=w/2;
+    if(r>h/2)r=h/2;
+    if(!r){gfx_rect(fb,x,y,w,h,color);return;}
+    gfx_rect(fb,x,y+r,w,h-2*r,color);
+    for(int row=0;row<r;++row) {
+        int distance=r-row-1,span=0;
+        while(span<r && (span+1)*(span+1)+distance*distance<=r*r)++span;
+        int margin=r-span;
+        gfx_rect(fb,x+margin,y+row,w-2*margin,1,color);
+        gfx_rect(fb,x+margin,y+h-row-1,w-2*margin,1,color);
     }
 }
 
-/* ★ v28: 左侧主色条（选中标记，Goldleaf 风格 3px） */
 static void gfx_accent_bar(uint32_t *fb, int x, int y, int h, uint32_t color) {
     gfx_rect(fb, x, y, 3, h, color);
 }
 
 /* UTF-8 解码 */
-static uint32_t utf8_next(const char **p) {
-    const uint8_t *s = (const uint8_t*)*p;
-    if (!*s) return 0;
-    uint32_t cp = 0;
-    int len = 0;
-    if (*s < 0x80) { cp = *s; len = 1; }
-    else if ((*s & 0xE0) == 0xC0) { cp = *s & 0x1F; len = 2; }
-    else if ((*s & 0xF0) == 0xE0) { cp = *s & 0x0F; len = 3; }
-    else if ((*s & 0xF8) == 0xF0) { cp = *s & 0x07; len = 4; }
-    else { (*p)++; return 0xFFFD; }
+#include "gc_ui_text.inc"
 
-    for (int i = 1; i < len; i++) {
-        if ((s[i] & 0xC0) != 0x80) { (*p) += len; return 0xFFFD; }
-        cp = (cp << 6) | (s[i] & 0x3F);
-    }
-    *p += len;
-    return cp;
-}
-
-/* 绘制文本 */
-static int draw_text(uint32_t *fb, int x, int y, int size, const char *str, uint32_t color) {
-    if (!g_face || !str) return x;
-    FT_Set_Pixel_Sizes(g_face, 0, size);
-
-    uint8_t cr = (color >> 0)  & 0xFF;
-    uint8_t cg = (color >> 8)  & 0xFF;
-    uint8_t cb = (color >> 16) & 0xFF;
-    int pen_x = x;
-    int baseline = y + size;
-
-    const char *p = str;
-    while (*p) {
-        uint32_t cp = utf8_next(&p);
-        if (cp == 0) break;
-        if (cp == '\n') break;
-
-        if (FT_Load_Char(g_face, cp, FT_LOAD_RENDER) != 0) continue;
-        FT_GlyphSlot slot = g_face->glyph;
-        FT_Bitmap *bmp = &slot->bitmap;
-
-        int gx = pen_x + slot->bitmap_left;
-        int gy = baseline - slot->bitmap_top;
-
-        for (unsigned int r = 0; r < bmp->rows; r++) {
-            int py = gy + (int)r;
-            if (py < 0 || py >= FB_HEIGHT) continue;
-            for (unsigned int c = 0; c < bmp->width; c++) {
-                int px = gx + (int)c;
-                if (px < 0 || px >= FB_WIDTH) continue;
-
-                uint8_t a = bmp->buffer[r * bmp->pitch + c];
-                if (a == 0) continue;
-
-                uint32_t *dst = fb + py * g_stride_words + px;
-                if (a == 255) {
-                    *dst = (0xFFu << 24) | ((uint32_t)cb << 16) | ((uint32_t)cg << 8) | cr;
-                } else {
-                    uint32_t cur = *dst;
-                    uint8_t br = (cur >> 0)  & 0xFF;
-                    uint8_t bg = (cur >> 8)  & 0xFF;
-                    uint8_t bb = (cur >> 16) & 0xFF;
-                    uint8_t out_r = (cr * a + br * (255 - a)) / 255;
-                    uint8_t out_g = (cg * a + bg * (255 - a)) / 255;
-                    uint8_t out_b = (cb * a + bb * (255 - a)) / 255;
-                    *dst = (0xFFu << 24) | ((uint32_t)out_b << 16) | ((uint32_t)out_g << 8) | out_r;
-                }
-            }
-        }
-        pen_x += slot->advance.x >> 6;
-    }
-    return pen_x;
-}
-
-/* ========================================================================= */
-/* ★ v5: 精确文字宽度测量 -- 原代码用 strlen()*N 估宽, 而 UTF-8 汉字占 3 字节,
- *   导致估出的宽度是实际的 2~3 倍, 文字被推得严重偏左/偏右。
- *   这里按「码点数」而非「字节数」计算, 汉字/全角按 1 个字宽, ASCII 按 0.5。
- *   返回像素宽度 (近似, 与 FreeType 实测偏差 < 10%) */
-static int text_width(const char *s, int size) {
-    if (!s) return 0;
-    const char *p = s;
-    int w = 0;
-    while (*p) {
-        uint32_t cp = utf8_next(&p);
-        if (cp == 0 || cp == '\n') break;
-        /* CJK / 全角 / 常用符号 = 整宽; ASCII 及窄符号 = 半宽 */
-        if (cp >= 0x1100 && !(cp >= 0x2010 && cp <= 0x203B)) w += size;
-        else w += (size + 1) / 2;
-    }
-    return w;
-}
-
-/* 居中绘制文字: 以 cx 为水平中心, 返回实际起点 x */
-static int draw_text_c(uint32_t *fb, int cx, int y, int size, const char *str, uint32_t color) {
-    int w = text_width(str, size);
-    int x = cx - w / 2;
-    draw_text(fb, x, y, size, str, color);
-    return x;
-}
-
-/* 右对齐绘制: 以 rx 为右边界 */
-static int draw_text_r(uint32_t *fb, int rx, int y, int size, const char *str, uint32_t color) {
-    int w = text_width(str, size);
-    int x = rx - w;
-    draw_text(fb, x, y, size, str, color);
-    return x;
-}
-
-/* ========================================================================= */
-/* ★ v5: 自绘符号 -- 系统共享字体缺 U+2212(−) / U+25C0(◀) / U+25B6(▶) 等字形,
- *   直接用矩形拼, 完全不依赖字体, 保证任何环境下都显示正常。
- *   cx,cy = 符号中心; sz = 符号半径/半宽; th = 笔画粗细 */
-/* 三角形 (dir: 0=上 1=下 2=左 3=右) */
 static void gfx_tri(uint32_t *fb, int cx, int cy, int sz, int dir, uint32_t color) {
     for (int i = 0; i < sz; i++) {
         int span = sz - i;                       /* 越远离尖端越宽 */
@@ -598,49 +477,12 @@ static void dlc_prog_frame(void) {
 
 /* 渲染屏幕中央提示框 (每帧调用, 到点自动隐藏) */
 static void draw_toast(uint32_t *fb) {
-    if (g_toast_msg[0] == '\0') return;
-    uint64_t elapsed = (svcGetSystemTick() - g_toast_tick) * 1000 / 19200000ULL; /* ns -> ms (192MHz) */
-    if (elapsed > 2500) { g_toast_msg[0] = '\0'; return; }
-
-    /* 淡出: 最后 500ms 渐隐 */
-    uint32_t alpha = 255;
-    if (elapsed > 2000) alpha = (uint32_t)(255 - (elapsed - 2000) * 255 / 500);
-    if (alpha == 0) { g_toast_msg[0] = '\0'; return; }
-
-    /* 估算文本宽度 (中文字符按字号宽, 近似) */
-    int msg_len = 0; const char *p = g_toast_msg;
-    while (*p) { uint32_t cp = utf8_next(&p); if (cp == 0) break; msg_len++; }
-    int font_h = 26;
-    int box_w = 60 + msg_len * font_h;
-    if (box_w > FB_WIDTH - 100) box_w = FB_WIDTH - 100;
-    int box_h = 72;
-    int bx = (FB_WIDTH - box_w) / 2;
-    int by = (FB_HEIGHT - box_h) / 2;
-
-    /* 半透明背景 + 金色边框 (带 alpha) */
-    for (int j = by; j < by + box_h; j++) {
-        for (int i = bx; i < bx + box_w; i++) {
-            if (i < 0 || i >= FB_WIDTH || j < 0 || j >= FB_HEIGHT) continue;
-            uint32_t *dst = fb + j * g_stride_words + i;
-            uint32_t cur = *dst;
-            uint8_t cr = (cur >> 0) & 0xFF, cg = (cur >> 8) & 0xFF, cb = (cur >> 16) & 0xFF;
-            uint8_t br = (0x18 >> 0) & 0xFF, bg = (0x1C >> 8) & 0xFF, bb = (0x22 >> 16) & 0xFF;
-            uint8_t a = (uint8_t)(200 * alpha / 255);
-            uint8_t or_ = (br * a + cr * (255 - a)) / 255;
-            uint8_t og = (bg * a + cg * (255 - a)) / 255;
-            uint8_t ob = (bb * a + cb * (255 - a)) / 255;
-            *dst = (0xFFu << 24) | ((uint32_t)ob << 16) | ((uint32_t)og << 8) | or_;
-        }
-    }
-    gfx_rect_outline(fb, bx, by, box_w, box_h, 2, C_BORDER_SEL);
-
-    /* 提示文本 (居中) */
-    int tx = bx + (box_w - msg_len * (font_h - 4)) / 2;
-    int ty = by + (box_h - font_h) / 2 - 2;
-    draw_text(fb, tx, ty, font_h, g_toast_msg, g_toast_color);
+    if(!g_toast_tick || (svcGetSystemTick()-g_toast_tick)/19200ULL>2500)return;
+    gfx_card(fb,LY_PAD,634,FB_WIDTH-2*LY_PAD,64,C_MODAL_BG,8);
+    gfx_accent_bar(fb,LY_PAD+6,646,40,g_toast_color);
+    draw_text_wrap(fb,LY_PAD+22,643,FB_WIDTH-2*LY_PAD-44,16,2,g_toast_msg,g_toast_color);
 }
 
-/* 从存档头部 0x04 提取 UTF-16LE 剧情任务标题及游戏时间戳 */
 static void extract_save_title(const uint8_t *header, char *out_title, size_t max_len) {
     if (!header || !out_title || max_len == 0) return;
     out_title[0] = '\0';
@@ -927,7 +769,7 @@ static const PresetSave PRESET_SAVES_EN[] = {
 #define GFX_MAX_ITEMS 96
 typedef struct {
     char name[48];       /* 字段名, 如 ShadowQuality */
-    char cn[32];         /* 中文名, 如 阴影质量 */
+    char cn[160];         /* 中文名, 如 阴影质量 */
     char value[16];      /* 原始值字符串, 如 "1" / "0.500000" / "true" */
     int  is_float;       /* 1=浮点步进, 0=整数/枚举 */
     int  is_bool;        /* 1=布尔(true/false) */
@@ -2756,7 +2598,7 @@ static void script_show_dir(void) {
         if (g_script_items[i].installed) ninst++;
     snprintf(g_script_dirinfo, sizeof(g_script_dirinfo),
              TR("脚本目录: %s\n磁盘上 %d 个 .nsc   已装 %d 个\n%s 内共 %d 个 .nsc 条目",
-                "Script dir: %s\n%d .nsc on disk   %d installed\n%d .nsc entries in %s"),
+                "Script dir: %s\n%d .nsc on disk   %d installed\n%s contains %d .nsc entries"),
              SCRIPT_DIR, n_nsc, ninst, GC_SCRIPT_REL_RPF, g_script_rpf_n);
     g_script_dirinfo_ok = 1;
     g_script_dirinfo_on = 1;
@@ -4596,6 +4438,9 @@ static int gc_verify_on_disk(void) {
     }
 }
 
+#include "gc_package_ui.inc"
+#include "gc_ui.inc"
+
 int main(int argc, char **argv) {
     romfsInit();
     detect_language();   /* ★ v6.3: 按系统语言切中/英 */
@@ -4628,51 +4473,23 @@ int main(int argc, char **argv) {
          * 连发: 首次按下触发, 持续按住 20 帧后每 6 帧重复触发
          * ★ v31: 左、右摇杆【完全同权】-- 两者输出按位或合并后走同一套导航逻辑，
          *   所以推哪根摇杆都一样（用户要求「右摇杆和左摇杆功能一样就行」）。 */
-        static u32 s_joy_held = 0;
-        static int s_joy_tick = 0;
-        u32 joy_now = joy_to_dpad(0) | joy_to_dpad(1);   /* ★ v31: 左右摇杆合并 */
-        /* 弹窗: 全方向导航(移动选项框); 主界面/画质页: 仅 ←/-> 并入 kDown (↑/↓ 走 nav_down) */
-        u32 nav_mask = (g_modal_mode != 0) ? 0xFFFFFFFF : (HidNpadButton_Left | HidNpadButton_Right);
-        u32 joy_eff = joy_now & nav_mask;
-        u32 joy_down = 0;
-        if (joy_eff & ~s_joy_held) {
-            joy_down = joy_eff & ~s_joy_held; /* 新按下的方向 */
-            s_joy_tick = 0;
-        } else if (joy_eff & s_joy_held) {
-            s_joy_tick++;
-            if (s_joy_tick >= 20 && (s_joy_tick % 6) == 0) joy_down = joy_eff; /* 长按连发 */
+        ui_context_sync();
+        const u32 direction_mask=HidNpadButton_Up|HidNpadButton_Down|HidNpadButton_Left|HidNpadButton_Right;
+        u32 directions=kHeld & direction_mask;
+        if(!directions) {
+            HidAnalogStickState left=padGetStickPos(&g_pad,0),right=padGetStickPos(&g_pad,1);
+            long long left_power=(long long)left.x*left.x+(long long)left.y*left.y;
+            long long right_power=(long long)right.x*right.x+(long long)right.y*right.y;
+            directions=joy_to_dpad(right_power>left_power?1:0);
         }
-        s_joy_held = joy_eff;
-        kDown |= joy_down;
+        unsigned repeated=ui_repeat(&g_ui_repeat,ui_direction(directions),svcGetSystemTick()/19200ULL);
+        kDown&=~direction_mask;
+        if(repeated==UI_UP)kDown|=HidNpadButton_Up;
+        if(repeated==UI_DOWN)kDown|=HidNpadButton_Down;
+        if(repeated==UI_LEFT)kDown|=HidNpadButton_Left;
+        if(repeated==UI_RIGHT)kDown|=HidNpadButton_Right;
+        u32 nav_down=0; /* Both sticks and D-pad now use one repeat/navigation path. */
 
-        /* 摇杆 ↑/↓ 独立注入: 1=上(上一行) 2=下(下一行) 0=无; 仅非弹窗页消费
-         * (弹窗已由 kDown 全方向处理, 这里强制清零避免双重触发) */
-        static u32 s_joy_nav_held = 0;
-        static int  s_joy_nav_tick = 0;
-        u32 joy_nav_dir = 0;
-        if (joy_now & HidNpadButton_Up)   joy_nav_dir = 1;
-        else if (joy_now & HidNpadButton_Down) joy_nav_dir = 2;
-        if (g_modal_mode != 0) joy_nav_dir = 0; /* 弹窗已全方向导航 */
-        u32 nav_down = 0; /* 本帧有效的摇杆行切换: 1=上一行 2=下一行 */
-        if (joy_nav_dir && joy_nav_dir != s_joy_nav_held) {
-            nav_down = joy_nav_dir; /* 新按下 */
-            s_joy_nav_tick = 0;
-        } else if (joy_nav_dir && joy_nav_dir == s_joy_nav_held) {
-            s_joy_nav_tick++;
-            if (s_joy_nav_tick >= 20 && (s_joy_nav_tick % 6) == 0) nav_down = joy_nav_dir; /* 长按连发 */
-        }
-        s_joy_nav_held = joy_nav_dir;
-
-        /* ★ v31: 右摇杆与左摇杆已合并到上面同一套逻辑（joy_now 按位或），
-         *   此处不再有独立的右摇杆处理分支。 */
-
-
-        /* =================================================================
-         * ★ v4: 触屏处理
-         *   命中测试用的是【上一帧】渲染时登记的 g_hot[] (1 帧延迟, 无感)。
-         *   命中后把动作转成「等价按键」并入 kDown, 或单独处理新动作
-         *   (页签切换 / 底部大号 −/+)。
-         * ================================================================= */
         touch_poll();
         int t_act = ACT_NONE, t_param = 0;
         if (g_touch_tapped && g_touch_x >= 0) {
@@ -4689,12 +4506,37 @@ int main(int argc, char **argv) {
         }
 
         /* ★ 自检报告显示时：点屏幕任意位置即关闭（不走热区，避免被别处拦截） */
-        if (g_gc_selftest_show && g_touch_tapped && g_touch_x >= 0) {
-            g_gc_selftest_show = 0;
+        int ui_overlay_locked=g_modal_mode || g_gc_confirm || g_dlc_confirm || ui_report_active();
+        if (g_gc_selftest_show && g_touch_tapped && g_touch_x >= 0 && t_act==ACT_NONE) {
+            g_gc_selftest_show = 0; t_act=ACT_NONE; kDown=0;
         }
 
+        int ui_input_locked=ui_overlay_locked || g_ui_actions_focus;
+        int ui_touch_action=t_act;
+        ui_touch(&t_act);
+        int ui_touch_handled=ui_touch_action!=t_act;
+        if(ui_touch_handled)kDown=0;
+        ui_controller(&kDown,&t_act,&t_param);
+        if(ui_input_locked || g_ui_actions_focus || ui_touch_handled) {
+            kHeld&=~(HidNpadButton_ZL|HidNpadButton_ZR);
+        }
+        if(ui_overlay_locked)kDown&=~HidNpadButton_Plus;
+
+        /* A package dialog consumes touch; underlying save/DLC controls stay inactive. */
+        if((g_modal_mode==MODE_PACKAGES || g_modal_mode==MODE_PACKAGE_CONFIRM) &&
+           t_act!=ACT_PACKAGE_SELECT && t_act!=ACT_PACKAGE_INSTALL &&
+           t_act!=ACT_PACKAGE_RESTORE && t_act!=ACT_PACKAGE_RECOVER &&
+           t_act!=ACT_CONFIRM && t_act!=ACT_BACK)t_act=ACT_NONE;
         /* 触屏动作 -> 等价按键 (复用原有全部逻辑, 不写第二套) */
         switch (t_act) {
+            case ACT_SELF_RADIO: if(!g_modal_mode) package_open("selfradio"); break;
+            case ACT_RADIO_IMPORTS: if(!g_modal_mode) package_open("radio"); break;
+            case ACT_PACKAGE_SELECT:
+                if(g_modal_mode==MODE_PACKAGES && t_param>=0 && t_param<g_package_count)g_modal_sel=t_param;
+                break;
+            case ACT_PACKAGE_INSTALL: if(g_modal_mode==MODE_PACKAGES)package_ask(0); break;
+            case ACT_PACKAGE_RESTORE: if(g_modal_mode==MODE_PACKAGES)package_ask(1); break;
+            case ACT_PACKAGE_RECOVER: if(g_modal_mode==MODE_PACKAGES)package_ask(2); break;
             case ACT_NAV_LEFT:   kDown |= HidNpadButton_Left;  break;
             case ACT_NAV_RIGHT:  kDown |= HidNpadButton_Right; break;
             case ACT_NAV_UP:
@@ -4774,7 +4616,7 @@ int main(int argc, char **argv) {
                 break;
             case ACT_SCROLL_DOWN:
                 if (g_tab == TAB_GFX) {
-                    int vis = (LY_BODY_H + 2) / 40;   /* v6.1: 放开 10 行上限，按实际空间 */
+                    int vis = UI_VALUE_VIS;   /* v6.1: 放开 10 行上限，按实际空间 */
                     if (g_gfx_cur_idx + 1 < g_gfx_count) g_gfx_cur_idx++;
                     if (g_gfx_cur_idx >= g_gfx_scroll + vis) g_gfx_scroll = g_gfx_cur_idx - vis + 1;
                 }
@@ -4784,7 +4626,7 @@ int main(int argc, char **argv) {
                 break;
             case ACT_SCROLL_BOTTOM:
                 if (g_tab == TAB_GFX && g_gfx_count > 0) {
-                    int vis = (LY_BODY_H + 2) / 40;   /* v6.1: 放开 10 行上限，按实际空间 */
+                    int vis = UI_VALUE_VIS;   /* v6.1: 放开 10 行上限，按实际空间 */
                     g_gfx_cur_idx = (char)(g_gfx_count - 1);
                     g_gfx_scroll = (g_gfx_count > vis) ? g_gfx_count - vis : 0;
                 }
@@ -5069,6 +4911,9 @@ int main(int argc, char **argv) {
             kDown = 0;   /* 本帧按键已消费完 */
         }
 
+        if(g_modal_mode==MODE_PACKAGES || g_modal_mode==MODE_PACKAGE_CONFIRM) {
+            package_input(kDown);kDown=0;
+        }
         /* ---------------- 模态弹窗处理 (1=内置存档,2=备份库,3=槽位,4=画质预设,5=画质文件选择) ---------------- */
         if (g_modal_mode != 0) {
             int total_items = 0;
@@ -5077,7 +4922,7 @@ int main(int argc, char **argv) {
             else if (g_modal_mode == 3) total_items = g_num_slots;
             else if (g_modal_mode == 4) total_items = NUM_GFX_PRESETS + 1; /* +1 = 导入选项 */
             else if (g_modal_mode == 5) total_items = g_gfx_switch_count;
-            else if (g_modal_mode == 6) total_items = 0; /* 自检结果: 仅查看 */
+            else if (g_modal_mode == 6) total_items = g_check_paths_count; /* 自检结果: 仅查看 */
             else if (g_modal_mode == MODE_SCRIPT_MGR) total_items = script_mgr_total();
             else if (g_modal_mode == MODE_SCRIPT_CONFIRM) total_items = 0;
 
@@ -5099,9 +4944,9 @@ int main(int argc, char **argv) {
             }
             if (kDown & HidNpadButton_A) {
                 if (g_modal_mode == 1) {
-                    if (load_preset_save(g_modal_sel) == 0) g_modal_mode = 0; /* 成功自动关闭 */
+                    if (load_preset_save(g_modal_sel) == 0) { g_modal_mode = 0; g_ui_tool_index = 8; } /* 成功自动关闭 */
                 } else if (g_modal_mode == 2) {
-                    if (load_backup_save(g_modal_sel) == 0) g_modal_mode = 0; /* 成功自动关闭 */
+                    if (load_backup_save(g_modal_sel) == 0) { g_modal_mode = 0; g_ui_tool_index = 8; } /* 成功自动关闭 */
                 } else if (g_modal_mode == 3) {
                     if (switch_to_slot(g_modal_sel) == 0) g_modal_mode = 0; /* 成功自动关闭 */
                 } else if (g_modal_mode == 4) {
@@ -5149,7 +4994,7 @@ int main(int argc, char **argv) {
             /* ---------------- ★ v4 画质页按键交互 (由页签驱动, 取代原 g_gfx_show) ---------------- */
 
             /* 一屏行数 (与渲染保持一致) */
-            int gfx_vis = (LY_BODY_H + 2) / 40;
+            int gfx_vis = UI_VALUE_VIS;
             if (gfx_vis > 10) gfx_vis = 10;
             if (gfx_vis < 1)  gfx_vis = 1;
 
@@ -5164,13 +5009,13 @@ int main(int argc, char **argv) {
                 } while (0)
 
             /* [←/->] 与 [↑/↓] 都做「切换画质项」(v4 起改数值统一交给底部 −/+) */
-            if (kDown & (HidNpadButton_Left | HidNpadButton_Up)) {
+            if (kDown & HidNpadButton_Up) {
                 if (g_gfx_count > 0) {
                     g_gfx_cur_idx = (char)((g_gfx_cur_idx + g_gfx_count - 1) % g_gfx_count);
                     GFX_ENSURE_VISIBLE();
                 }
             }
-            if (kDown & (HidNpadButton_Right | HidNpadButton_Down)) {
+            if (kDown & HidNpadButton_Down) {
                 if (g_gfx_count > 0) {
                     g_gfx_cur_idx = (char)((g_gfx_cur_idx + 1) % g_gfx_count);
                     GFX_ENSURE_VISIBLE();
@@ -5206,6 +5051,8 @@ int main(int argc, char **argv) {
             /* ★ v24: L/R 已收归「全局切页签」, 这里不再接管
              *   （原「翻到顶/翻到底」保留为按钮栏的「翻到顶」「翻到底」） */
 
+            if(kDown & HidNpadButton_Left)gfx_step(-1);
+            if(kDown & HidNpadButton_Right)gfx_step(1);
             #undef GFX_ENSURE_VISIBLE
 
             /* [A 键]: 保存画质 */
@@ -5447,7 +5294,7 @@ int main(int argc, char **argv) {
             } else if (g_dlc_view == 0) {
                 /* ---- 已装列表 ---- */
                 /* ★ v27b: 行高 44->38（354/38=9 行，44 只装得下 8 行） */
-                int vis = (LY_BODY_H + 4) / 50;   /* v6.1: 与渲染端 row_h=50 对齐 + 放开上限 */
+                int vis = UI_LIST_VIS;   /* v6.1: 与渲染端 row_h=50 对齐 + 放开上限 */
                 /* ★ v28: 右摇杆 nav_down 转 kDown Up/Down（快速滚动 3 行） */
                 if (nav_down == 1) {
                     int steps = g_fast_scroll > 0 ? g_fast_scroll : 1;
@@ -5495,7 +5342,7 @@ int main(int argc, char **argv) {
             } else {
                 /* ---- 待导入列表 ---- */
                 /* ★ v27b: 行高同步 38 */
-                int vis = (LY_BODY_H + 4) / 50;   /* v6.1: 与渲染端 row_h=50 对齐 + 放开上限 */
+                int vis = UI_LIST_VIS;   /* v6.1: 与渲染端 row_h=50 对齐 + 放开上限 */
                 /* ★ v28: 右摇杆快速滚动 */
                 if (nav_down == 1) {
                     int steps = g_fast_scroll > 0 ? g_fast_scroll : 1;
@@ -5590,6 +5437,7 @@ int main(int argc, char **argv) {
             if (kDown & HidNpadButton_B) {
                 g_tab = TAB_DLC;
             }
+
             if (kDown & HidNpadButton_A) {
                 if (g_dirty) save_to_disk();
                 if (g_gfx_dirty) gfx_save();
@@ -5611,1536 +5459,19 @@ int main(int argc, char **argv) {
          *   588..636  统一按钮栏（★ 按页签切换按钮组, 消除重叠）
          *   642..678  提示行
          * ===================================================================== */
-        hot_reset();   /* 每帧重建热区（命中测试用上一帧的，1 帧延迟无感） */
+        ui_draw_app(framebuf);
 
-        /* 1. 背景底色 */
-        gfx_rect(framebuf, 0, 0, FB_WIDTH, FB_HEIGHT, C_BG);
-
-        /* 2. 顶部栏 -- ★ v28: 无底部分隔线（去边框化） */
-        gfx_rect(framebuf, 0, LY_HEADER_Y, FB_WIDTH, LY_HEADER_H, C_HEADER);
-
-        draw_text(framebuf, LY_PAD, 12, 24, TR("GTA V 工具箱", "GTA V Toolbox"), C_TEXT);
-        draw_text(framebuf, LY_PAD, 42, 12, "v6.3.4", C_TEXT_MUTED);   /* ★ v6.2: 原为 "v5.7" 一直没跟着版本走 */
-
-        /* 3. 页签（可点）-- ★ v28: hbmenu 式底边高亮条，无描边 */
-        {
-            /* ★ 页签：直接用 TABS[] 单一数据源（名字/ID/动作绑在一起）
-             * ★ v5.5: 页签从 5 个增加到 6 个 ⇒ 缩窄到 138，避免溢出屏宽
-             *   6 × (138+6) = 864，起点 372 ⇒ 终点 1236 < 1280 ✓
-             *   标题"GTA V 工具箱"(24px≈200宽) + 版本号 在 0..372 内，不重叠 */
-            int tw = 138, th = 42, ty = 10, tx0 = 372;
-            for (int t = 0; t < NUM_TABS; t++) {
-                int tx = tx0 + t * (tw + 6);
-                int sel = (g_tab == TABS[t].id);
-                gfx_card(framebuf, tx, ty, tw, th, sel ? C_CARD_SEL : C_HEADER, 6);
-                /* 选中 = 底部 2px 主色条（hbmenu 风格） */
-                if (sel) gfx_rect(framebuf, tx + 6, ty + th - 3, tw - 12, 2, C_ACCENT);
-                draw_text_c(framebuf, tx + tw / 2, ty + 11, 18,
-                            TABS[t].name, sel ? C_ACCENT : C_TEXT_MUTED);
-                hot_add(tx, ty, tw, th, TABS[t].action, 0);
-            }
-        }
-
-        /* 4. 信息栏 -- ★ v28: 无描边圆角卡片 */
-        gfx_card(framebuf, LY_PAD, LY_INFO_Y, FB_WIDTH - LY_PAD * 2, LY_INFO_H, C_CARD, 8);
-        {
-            char info[320];
-            if (g_tab == TAB_PERF) {
-                if (g_gc_opened) {
-                    snprintf(info, sizeof(info),
-                             TR("gameconfig.xml  %d B   switch 段 %d 项   Any 基准 %d 项   on_disk %d",
-                                "gameconfig.xml  %d B   switch section %d   Any baseline %d   on_disk %d"),
-                             (int)g_gc_xml_len, g_gc_n_switch, g_gc_n_any, g_gc_orig_on_disk);
-                } else {
-                    snprintf(info, sizeof(info),
-                             TR("未载入 update.rpf%s", "update.rpf not loaded%s"),
-                             g_gc_err ? TR(" (打开失败)", " (open failed)") : "");
-                    if (g_gc_err) {
-                        const char *le = gc_rpf_last_error();
-                        if (le && le[0]) {
-                            snprintf(info, sizeof(info), TR("打开失败: %s", "Open failed: %s"), le);
-                        }
-                    }
-                }
-            } else if (g_tab == TAB_GFX) {
-                const char *fn = g_gfx_path[0] ? strrchr(g_gfx_path, '/') : NULL;
-                fn = fn ? fn + 1 : (g_gfx_path[0] ? g_gfx_path : TR("未找到 settings.xml", "settings.xml not found"));
-                snprintf(info, sizeof(info), TR("画质文件: %s   共 %d 项   当前第 %d 项",
-                                                "GFX file: %s   %d items   current #%d"),
-                         fn, g_gfx_count,
-                         g_gfx_count > 0 ? (int)g_gfx_cur_idx + 1 : 0);
-            } else if (g_tab == TAB_DLC) {
-                if (g_dlc_view == 0) {
-                    int full = 0, part = 0;
-                    for (int i = 0; i < g_dlc_count; i++) {
-                        if (g_dlc_items[i].full) full++;
-                        else if (g_dlc_items[i].registered || g_dlc_items[i].mounted) part++;
-                    }
-                    snprintf(info, sizeof(info),
-                             TR("已装 dlcpack %d 个   完整注册 %d 个   半注册 %d 个%s",
-                                "Installed dlcpacks: %d   fully registered %d   partial %d%s"),
-                             g_dlc_count, full, part,
-                             g_dlc_xml_loaded ? "" : TR("   [dlclist 未载入]", "   [dlclist not loaded]"));
-                } else {
-                    snprintf(info, sizeof(info),
-                             TR("待导入 dlcpack %d 个   来源目录 %d 个   放到 sdmc:/switch/gta5save/dlc/ 下",
-                                "Pending dlcpacks: %d   source dirs: %d   put them in sdmc:/switch/gta5save/dlc/"),
-                             g_dlc_src_count, g_dlc_src_dir_n);
-                }
-            } else if (g_tab == TAB_SCRIPT) {
-                /* ★ v5.6: 脚本页信息栏 —— 明示目录 + RPF 实况（读失败要说出来） */
-                if (g_script_rpf_n < 0) {
-                    snprintf(info, sizeof(info),
-                             TR("[!] 读 update2.rpf 失败: %s", "[!] Failed to read update2.rpf: %s"),
-                             g_script_rpf_err[0] ? g_script_rpf_err : TR("未知原因", "unknown"));
-                } else {
-                    int ninst = 0;
-                    for (int i = 0; i < g_script_count; i++)
-                        if (g_script_items[i].installed) ninst++;
-                    snprintf(info, sizeof(info),
-                             TR("目录 %s | .nsc %d 个（已装 %d） | RPF 内 %d 条",
-                                "Dir %s | .nsc %d (installed %d) | in RPF %d"),
-                             SCRIPT_DIR, g_script_count, ninst, g_script_rpf_n);
-                }
-            } else if (g_tab == TAB_TOOL) {
-                const char *fn = strrchr(g_save_path, '/');
-                fn = fn ? fn + 1 : g_save_path;
-                /* ★ v6.3.1: 末尾带语言标记（lang=en/zh），实机一眼看出语言检测是否生效 */
-                snprintf(info, sizeof(info), TR("存档: %s   %zu KB   槽位 %d 个   备份 %d 个   [lang=zh]",
-                                                "Save: %s   %zu KB   slots %d   backups %d   [lang=en]"),
-                         fn, g_save_sz / 1024, g_num_slots, g_num_backups);
-            } else {
-                const char *cur_fn = (g_num_slots > 0) ? g_slots[g_active_slot_idx].filename
-                                                       : "SGTA50000";
-                const char *disp_user = g_user_name[0] ? g_user_name : TR("未知玩家", "Player");
-                snprintf(info, sizeof(info), TR("玩家: %s   槽位: %s   剧情: %s",
-                                                "Player: %s   Slot: %s   Story: %s"),
-                         disp_user, cur_fn,
-                         g_current_title[0] ? g_current_title : TR("自定义存档", "Custom save"));
-            }
-            draw_text(framebuf, LY_PAD + 18, LY_INFO_Y + 11, 16, info, C_ACCENT);
-        }
-        /* 未保存标记: 自绘圆点, 不依赖字体 */
-        {
-            int dirty = (g_tab == TAB_GFX) ? g_gfx_dirty : g_dirty;
-            if (dirty) {
-                gfx_dot(framebuf, FB_WIDTH - LY_PAD - 132, LY_INFO_Y + 21, 6, C_RED);
-                draw_text(framebuf, FB_WIDTH - LY_PAD - 118, LY_INFO_Y + 11, 16,
-                          TR("有未保存修改", "Unsaved changes"), C_RED);
-            }
-        }
-
-        /* 5. ★ v6.1: 原「角色标签栏」已随「存档修改」页一并移除。
-         *   该条带（112..150）现被内容区吸收 —— 见 LY_BODY_Y/LY_BODY_H 定义。 */
-
-        /* =====================================================================
-         * 6. 内容区（按页签切换）
-         * ===================================================================== */
-        if (g_tab == TAB_SAVE) {
-            /* ---------- ★ v25 存档页：属性列表（可点）
-             *   原 3×3 网格改成单列列表：左名字、右数值、技能项底部带进度条
-             *   ★ v29: 行高 44，9 项一屏装下（LY_BODY_H=420），底部留出页脚行 ---------- */
-            int lx = LY_PAD, ly = LY_BODY_Y, lw = LY_CONTENT_R - lx;
-            /* ★ v29 修复：行高 46->44 -- 原来 9×46=414 ⇒ 列表到 y=570，
-             *   页脚文字画在 578..591，被按钮栏（LY_BTN_Y=584 起）压住。
-             *   44 时列表到 552，页脚 560..573，安全留白 11px。 */
-            int row_h = 44;
-            int vis = LY_BODY_H / row_h;      /* = 9，刚好 NUM_ATTRS */
-            if (vis > NUM_ATTRS) vis = NUM_ATTRS;
-            if (g_cur_attr < 0) g_cur_attr = 0;
-            if (g_cur_attr >= NUM_ATTRS) g_cur_attr = NUM_ATTRS - 1;
-
-            for (int r = 0; r < vis; r++) {
-                int a = r;                    /* 一屏放得下，不用滚动 */
-                int iy = ly + r * row_h;
-                int sel = (a == g_cur_attr);
-                uint32_t val = g_values[g_cur_char][a];
-
-                /* ★ v28: 圆角卡片 + 选中主色条；类型色条保留（金钱绿/技能蓝） */
-                gfx_card(framebuf, lx, iy, lw, row_h - 3, sel ? C_ITEM_SEL : C_CARD, 6);
-                gfx_rect(framebuf, lx + 2, iy + 2, 5, row_h - 8,
-                         (a == 0) ? C_GREEN : C_BLUE);
-                if (sel) gfx_accent_bar(framebuf, lx + lw - 12, iy + 4, row_h - 11, C_ACCENT);
-
-                draw_text(framebuf, lx + 18, iy + 5, 18, ATTR_NAME(a), C_TEXT);
-
-                if (!g_found[g_cur_char][a]) {
-                    draw_text_r(framebuf, lx + lw - 24, iy + 12, 15,
-                                TR("(存档中未找到)", "(not in save)"), C_RED);
-                } else if (a == 0) {
-                    char vs[48];
-                    snprintf(vs, sizeof(vs), "$ %'" PRIu32, val);
-                    draw_text_r(framebuf, lx + lw - 24, iy + 9, 24, vs, C_GREEN);
-                } else {
-                    char vs[32];
-                    snprintf(vs, sizeof(vs), "%u / 100", val);
-                    draw_text_r(framebuf, lx + lw - 24, iy + 8, 20, vs,
-                                (val >= 100) ? C_GREEN : C_TEXT);
-                    /* 进度条（名字下方，靠左，不压数值）-- v28: 无边框纯色条 */
-                    int bw = 300, bh = 6, bx = lx + 18, by = iy + 32;
-                    gfx_rect(framebuf, bx, by, bw, bh, C_BG);
-                    int fw = (int)((val > 100 ? 100 : val) * bw / 100);
-                    if (fw > 0)
-                        gfx_rect(framebuf, bx, by, fw, bh, C_BLUE);
-                }
-                hot_add(lx, iy, lw, row_h - 3, ACT_PICK_ITEM, a);
-            }
-            {
-                char pg[128];
-                snprintf(pg, sizeof(pg),
-                         TR("%s : 共 %d 项   ↑↓<-->选择  ZL/ZR 调值(可长按快调)  X 拉满  Y 切步长",
-                             "%s : %d items   Up/Down/Left/Right select  ZL/ZR adjust (hold)  X max  Y step"),
-                         CHAR_NAME(g_cur_char), NUM_ATTRS);
-                draw_text(framebuf, lx, ly + vis * row_h + 8, 13, pg, C_TEXT_MUTED);
-            }
-        }
-        else if (g_tab == TAB_GFX) {
-            /* ---------- 画质页：可滚动列表（可点） ----------
-             * ★ v5 修正:
-             *   (1) 列表右边留出 22px 给滚动条, 数值不再被滚动按钮压住
-             *   (2) 滚动按钮移到列表【左侧外】的独立竖条区, 彻底避开数值列
-             *   (3) 数值用 text_width 精确右对齐 (原来是 strlen*10 错估) */
-            int lx = LY_PAD, ly = LY_BODY_Y;
-            int row_h = 40, vis = (LY_BODY_H + 2) / row_h;   /* v6.1: 464/40=11 行 */
-            int lw = LY_CONTENT_R - lx;                      /* 列表宽度 (到 1218) */
-
-            /* 裁剪：只画可见范围 (★ 防负数) */
-            int max_scroll = g_gfx_count - vis;
-            if (max_scroll < 0) max_scroll = 0;
-            if (g_gfx_scroll > max_scroll) g_gfx_scroll = max_scroll;
-            if (g_gfx_scroll < 0) g_gfx_scroll = 0;
-
-            for (int r = 0; r < vis; r++) {
-                int i = g_gfx_scroll + r;
-                if (i >= g_gfx_count) break;
-                GfxItem *it = &g_gfx_items[i];
-                int iy = ly + r * row_h;
-                int sel = (i == g_gfx_cur_idx);
-
-                /* ★ v28: 圆角卡片 + 选中主色条 */
-                gfx_card(framebuf, lx, iy, lw, row_h - 3, sel ? C_ITEM_SEL : C_CARD, 6);
-                if (sel) gfx_accent_bar(framebuf, lx + 4, iy + 4, row_h - 11, C_ACCENT);
-
-                draw_text(framebuf, lx + 16, iy + 9, 17, it->cn,
-                          sel ? C_TEXT : (it->is_key ? C_TEXT : C_TEXT_MUTED));
-
-                /* 值靠右显示 (精确测量, 右边界 = 列表右边 - 16) */
-                draw_text_r(framebuf, lx + lw - 16, iy + 9, 17, it->value, C_GREEN);
-
-                hot_add(lx, iy, lw, row_h - 3, ACT_PICK_ITEM, 100000 + i);
-            }
-
-            /* 滚动条 (紧贴列表右侧 22px 通道内, 不压任何文字) -- v28: 无边框纯色 */
-            if (g_gfx_count > vis && max_scroll > 0) {
-                int sb_x = LY_CONTENT_R + 6, sb_y = ly, sb_h = vis * row_h - 3;
-                gfx_rect(framebuf, sb_x, sb_y, 8, sb_h, C_CARD);
-                int th = sb_h * vis / g_gfx_count;
-                if (th < 16) th = 16;
-                if (th > sb_h) th = sb_h;
-                int ty2 = sb_y + (sb_h - th) * g_gfx_scroll / max_scroll;
-                gfx_rect(framebuf, sb_x + 1, ty2 + 1, 6, th - 2, C_ACCENT);
-            }
-        }
-        else if (g_tab == TAB_PERF) {
-            /* =================================================================
-             * ★ v6 性能调参页
-             * ================================================================= */
-            int lx = LY_PAD, ly = LY_BODY_Y, lw = FB_WIDTH - LY_PAD * 2;
-
-            if (!g_gc_opened) {
-                /* ---- 未载入：显示提示 + 载入按钮 ---- */
-                gfx_card(framebuf, lx, ly, lw, 268, C_CARD, 8);
-                draw_text(framebuf, lx + 20, ly + 12, 19, TR("性能调参 (gameconfig.xml)", "Performance tuning (gameconfig.xml)"), C_ACCENT);
-                /* ★ 实测结论：这些参数不影响帧率（瓶颈在硬件），必须说明，避免误导 */
-                draw_text(framebuf, lx + 20, ly + 40, 14,
-                          TR("实测: 本页参数只改变【人口/载具密度】，不影响帧率",
-                             "Tested: these only change ped/vehicle density, NOT framerate"), C_ACCENT);
-                draw_text(framebuf, lx + 20, ly + 62, 13,
-                          TR("瓶颈在 Tegra X1 的 CPU/GPU/内存带宽，需超频才能提帧",
-                             "The bottleneck is the Tegra X1 CPU/GPU/RAM; overclocking is the only fix"), C_TEXT_MUTED);
-                if (g_gc_err) {
-                    char eb[300];
-                    snprintf(eb, sizeof(eb), TR("打开失败: %s", "Open failed: %s"), gc_rpf_last_error());
-                    draw_text(framebuf, lx + 20, ly + 90, 15, eb, C_RED);
-                    /* 逐条显示候选路径的探测结果 */
-                    if (g_gc_diag_n == 0) gc_build_diag();
-                    for (int i = 0; i < g_gc_diag_n && i < 4; i++) {
-                        draw_text(framebuf, lx + 20, ly + 114 + i * 20, 13,
-                                  g_gc_diag[i],
-                                  strncmp(g_gc_diag[i], TR("存在", "exists"), 4) == 0 ? C_GREEN : C_TEXT_MUTED);
-                    }
-                } else {
-                    draw_text(framebuf, lx + 20, ly + 90, 16,
-                              TR("点「载入」读取 update.rpf 里的 gameconfig.xml",
-                                 "Tap Load to read gameconfig.xml from update.rpf"), C_TEXT);
-                    draw_text(framebuf, lx + 20, ly + 118, 14,
-                              TR("路径: sdmc:/atmosphere/contents/0100b00b51230000/romfs/update/update.rpf",
-                              "path: sdmc:/atmosphere/contents/0100b00b51230000/romfs/update/update.rpf"),
-                              C_TEXT_MUTED);
-                }
-                int bx = lx + 20, by = ly + 200, bw = 180, bh = 46;
-                gfx_card(framebuf, bx, by, bw, bh, C_HEADER, 6);
-                draw_text_c(framebuf, bx + bw / 2, by + 12, 19, TR("载入", "Load"), C_ACCENT);
-                hot_add(bx, by, bw, bh, ACT_GC_LOAD, 0);
-
-                /* ★ 自检按钮：把路径探测结果直接显示在屏幕上 */
-                int bx2 = bx + bw + 16, bw2 = 200;
-                gfx_card(framebuf, bx2, by, bw2, bh, C_CARD, 6);
-                draw_text_c(framebuf, bx2 + bw2 / 2, by + 12, 19, TR("路径自检", "Self-test"), C_BLUE);
-                hot_add(bx2, by, bw2, bh, ACT_GC_SELFTEST, 0);
-            } else {
-                /* =================================================================
-                 * ★★ v24 手动调整（用户要求「预设列表删除，只保留恢复原版的」）
-                 *   原「16 套预设档位列表」视图已删除；参数列表直接展开。
-                 *   列表已按重要性排序：S 关键(金) -> A 重要(蓝) -> B 次要(灰) -> C 勿调(红)
-                 * ================================================================= */
-                int row_h = 34, vis = GC_KNOB_VIS;
-                for (int r = 0; r < vis; r++) {
-                    int i = g_gc_knob_scr + r;
-                    if (i >= GC_NUM_KNOB_META) break;
-                    const GcKnobMeta *m = &GC_KNOB_META[i];
-                    int iy = ly + r * row_h;
-                    int sel = (i == g_gc_knob);
-
-                    /* 权重配色：S 金 / A 蓝 / B 灰 / C 红（警告别调） */
-                    uint32_t wcol = (m->weight == 1) ? C_GOLD
-                                  : (m->weight == 2) ? C_BLUE
-                                  : (m->weight == 3) ? C_TEXT_MUTED
-                                                     : C_RED;
-
-                    gfx_card(framebuf, lx, iy, lw, row_h - 3, sel ? C_ITEM_SEL : C_CARD, 6);
-                    /* 左侧权重色条 */
-                    gfx_rect(framebuf, lx + 2, iy + 2, 4, row_h - 7, wcol);
-                    if (sel) gfx_accent_bar(framebuf, lx + lw - 12, iy + 4, row_h - 11, C_ACCENT);
-
-                    /* 当前值：已改的用金色，否则读 XML（switch 段优先，其次 Any） */
-                    int cur = gc_get_edited(m->key);
-                    int is_edited = (cur != INT32_MIN);
-                    if (!is_edited) {
-                        int v = 0;
-                        if (gc_xml_get_int((char*)g_gc_xml, g_gc_xml_len,
-                                           g_gc_sw_a, g_gc_sw_b, m->key, &v) == GC_OK) cur = v;
-                        else if (gc_xml_get_int((char*)g_gc_xml, g_gc_xml_len,
-                                                g_gc_any_a, g_gc_any_b, m->key, &v) == GC_OK) cur = v;
-                        else cur = 0;
-                    }
-
-                    /* 权重标签 + 中文名 */
-                    char nb[96];
-                    snprintf(nb, sizeof(nb), "[%s] %s",
-                             m->weight == 1 ? "S" : m->weight == 2 ? "A"
-                           : m->weight == 3 ? "B" : "C",
-                             g_lang_en ? (m->cn_en ? m->cn_en : m->cn) : m->cn);
-                    draw_text(framebuf, lx + 14, iy + 6, 15, nb, sel ? C_ACCENT : wcol);
-
-                    char vb[64];
-                    snprintf(vb, sizeof(vb), "%d", cur);
-                    draw_text_r(framebuf, lx + lw - 110, iy + 6, 16, vb,
-                                is_edited ? C_GOLD : C_GREEN);
-                    char rb[32];
-                    snprintf(rb, sizeof(rb), "%d~%d", m->lo, m->hi);
-                    draw_text_r(framebuf, lx + lw - 16, iy + 7, 13, rb, C_TEXT_MUTED);
-                    hot_add(lx, iy, lw, row_h - 3, ACT_GC_PICK_KNOB, i);
-                }
-                char pg[128];
-                snprintf(pg, sizeof(pg),
-                         TR("旋钮 %d/%d   已改 %d 项   [S]关键 [A]重要 [B]次要 [C]容量池勿调",
-                            "Knob %d/%d   %d edited   [S]key [A]major [B]minor [C]pool - do not touch"),
-                         g_gc_knob + 1, GC_NUM_KNOB_META, g_gc_edited_n);
-                draw_text(framebuf, lx, ly + vis * row_h + 4, 13, pg, C_TEXT_MUTED);
-            }
-        }
-        else if (g_tab == TAB_DLC) {
-            /* ================= DLC 管理页 =================
-             * 两个视图：0=已装 dlcpack（可注册/注销）  1=待导入（可导入）
-             * ★ v5.5: 脚本 mod（.nsc）已独立成「脚本MOD」页 */
-            int lx = LY_PAD, ly = LY_BODY_Y, lw = LY_CONTENT_R - lx;
-
-            if (!g_dlc_xml_loaded) {
-                /* ---- 未载入：显示说明 + 载入按钮 ---- */
-                gfx_card(framebuf, lx, ly, lw, 190, C_CARD, 8);
-                draw_text(framebuf, lx + 20, ly + 14, 19, TR("DLC 管理（PC 车辆 mod 移植）", "DLC Manager (PC vehicle mod porting)"), C_ACCENT);
-                draw_text(framebuf, lx + 20, ly + 48, 15,
-                          TR("先把 PC 的 dlcpack 目录（含 dlc.rpf）放进 sdmc:/switch/gta5save/dlc/",
-                             "First put the PC dlcpack folder (with dlc.rpf) into sdmc:/switch/gta5save/dlc/"), C_TEXT);
-                draw_text(framebuf, lx + 20, ly + 72, 15,
-                          TR("本工具会：(1) 复制到 dlcpacks/  (2) 写 dlclist.xml  (3) 写 extratitleupdatedata.meta",
-                             "This tool will: (1) copy to dlcpacks/  (2) write dlclist.xml  (3) write extratitleupdatedata.meta"), C_TEXT);
-                draw_text(framebuf, lx + 20, ly + 96, 15,
-                          TR("(4) 回读校验  (5) 检查车辆资源是否缺 _hi 高模（缺了撞击会闪退）",
-                             "(4) verify by re-read  (5) check vehicle _hi models (missing = crash on impact)"), C_TEXT);
-                draw_text(framebuf, lx + 20, ly + 126, 14,
-                          TR("落点: romfs/update/switch/dlcpacks/<名字>/dlc.rpf",
-                             "Target: romfs/update/switch/dlcpacks/<name>/dlc.rpf"), C_TEXT_MUTED);
-                draw_text(framebuf, lx + 20, ly + 148, 14,
-                          TR("★ 一次只加一个 DLC，启动确认能进游戏再加下一个",
-                             "* Add one DLC at a time; confirm the game boots before adding the next"), C_GOLD);
-
-                int bx = lx + 20, by = ly + 200, bw = 220, bh = 48;
-                gfx_card(framebuf, bx, by, bw, bh, C_HEADER, 6);
-                draw_text_c(framebuf, bx + bw / 2, by + 13, 19, TR("载入并扫描", "Load & Scan"), C_ACCENT);
-                hot_add(bx, by, bw, bh, ACT_DLC_LOAD, 0);
-            } else if (g_dlc_view == 0) {
-                /* ---- 已装列表 ---- */
-                int row_h = 50, vis = (LY_BODY_H + 4) / row_h;   /* v6.1: 放开上限 */
-                if (g_dlc_sel < 0) g_dlc_sel = 0;
-                if (g_dlc_sel >= g_dlc_count) g_dlc_sel = g_dlc_count > 0 ? g_dlc_count - 1 : 0;
-                if (g_dlc_sel < g_dlc_scr) g_dlc_scr = g_dlc_sel;
-                if (g_dlc_sel >= g_dlc_scr + vis) g_dlc_scr = g_dlc_sel - vis + 1;
-                if (g_dlc_scr < 0) g_dlc_scr = 0;
-
-                if (g_dlc_count == 0) {
-                    draw_text(framebuf, lx + 20, ly + 20, 18,
-                              TR("dlcpacks 目录里没有子目录（路径不对？）", "no subdirs in dlcpacks (wrong path?)"), C_RED);
-                    draw_text(framebuf, lx + 20, ly + 50, 14, DLC_DLCPACKS, C_TEXT_MUTED);
-                }
-                for (int r = 0; r < vis; r++) {
-                    int i = g_dlc_scr + r;
-                    if (i >= g_dlc_count) break;
-                    DlcItem *it = &g_dlc_items[i];
-                    int iy = ly + r * row_h;
-                    int sel = (i == g_dlc_sel);
-
-                    /* ★ v28: 圆角卡片无描边；选中 = 色块变亮 + 左侧 3px 主色条 */
-                    gfx_card(framebuf, lx, iy, lw, row_h - 4, sel ? C_ITEM_SEL : C_CARD, 6);
-                    if (sel) gfx_accent_bar(framebuf, lx + 4, iy + 4, row_h - 12, C_ACCENT);
-
-                    char n1[200];
-                    /* ★ v5.1: 有中文名就显示中文名（目录名挪到第 2 行） */
-                    snprintf(n1, sizeof(n1), "%s", it->cn[0] ? it->cn : it->name);
-                    draw_text(framebuf, lx + 18, iy + 5, 17, n1, C_TEXT);
-
-                    /* ★ v28: 状态点（绿=完整注册 / 金=半注册 / 灰=未注册）+ 文字 */
-                    {
-                        uint32_t dotc = it->full ? C_GREEN
-                                      : ((it->registered || it->mounted) ? C_GOLD : C_TEXT_MUTED);
-                        const char *stt = it->full ? TR("已注册", "registered")
-                                        : ((it->registered || it->mounted) ? TR("半注册", "partial") : TR("未注册", "unregistered"));
-                        gfx_dot(framebuf, lx + 200, iy + 12, 4, dotc);
-                        draw_text(framebuf, lx + 212, iy + 7, 12, stt, C_TEXT_MUTED);
-                    }
-
-                    char n2[260];
-                    if (it->cn[0])   /* 有中文名 ⇒ 第 2 行开头补上目录名，便于对照路径 */
-                        snprintf(n2, sizeof(n2), "%s  dlc.rpf %u KB  dlclist:%s etud:%s",
-                                 it->name, it->rpf_size / 1024,
-                                 it->registered ? TR("有", "yes") : TR("无", "no"),
-                                 it->mounted ? TR("有", "yes") : TR("无", "no"));
-                    else
-                        snprintf(n2, sizeof(n2), "dlc.rpf %u KB   dlclist:%s   etud:%s",
-                                 it->rpf_size / 1024,
-                                 it->registered ? TR("有", "yes") : TR("无", "no"),
-                                 it->mounted ? TR("有", "yes") : TR("无", "no"));
-                    draw_text(framebuf, lx + 18, iy + 22, 12, n2, C_TEXT_MUTED);
-
-                    /* ★ v32: 第 3 行 -- 资源构成（模型 / 地图数据 / 贴图） */
-                    {
-                        char n3[220];
-                        if (it->spawn[0])
-                            snprintf(n3, sizeof(n3), TR("模型 %d   地图 %d   贴图 %d   刷车: %s",
-                                      "models %d   map %d   tex %d   spawn: %s"),
-                                     it->n_model, it->n_map, it->n_tex, it->spawn);
-                        else
-                            snprintf(n3, sizeof(n3), TR("模型 %d   地图 %d   贴图 %d",
-                                      "models %d   map %d   tex %d"),
-                                     it->n_model, it->n_map, it->n_tex);
-                        draw_text(framebuf, lx + 18, iy + 35, 11, n3,
-                                  it->spawn[0] ? C_ACCENT : C_TEXT_MUTED);
-                    }
-
-                    /* ★ v31: 地图数据自检提醒（只在异常时显示，避免杂乱）
-                     *   map_st==2 ⇒ manifest 不在主 rpf ⇒ 实测：贴图能显示、
-                     *   模型完全不渲染、无碰撞（AkinaV 秋名山就是这个症状） */
-                    if (it->map_st == 2) {
-                        draw_text_r(framebuf, lx + lw - 400, iy + 22, 12,
-                                    TR("地图数据不在主包(不会加载)", "map data not in main rpf (won't load)"), C_RED);
-                    } else if (it->map_st == 1) {
-                        draw_text_r(framebuf, lx + lw - 400, iy + 22, 12,
-                                    TR("地图正常", "map ok"), C_GREEN);
-                    }
-
-                    /* ★ 平台格式徽标：PC 格式 = 会闪退，必须显眼 */
-                    {
-                        const char *fb_txt;
-                        uint32_t fb_col;
-                        if (it->fmt == 1)      { fb_txt = TR("Switch 格式", "Switch format"); fb_col = C_GREEN; }
-                        else if (it->fmt == 0) { fb_txt = TR("★ PC 格式（会闪退！）", "* PC format (crashes!)"); fb_col = C_RED; }
-                        else                   { fb_txt = TR("读不了", "unreadable"); fb_col = C_TEXT_MUTED; }
-                        draw_text_r(framebuf, lx + lw - 200, iy + 22, 12, fb_txt, fb_col);
-                    }
-
-                    if (sel) {
-                        draw_text_r(framebuf, lx + lw - 16, iy + 5, 14,
-                                    it->full ? TR("A 注销", "A Unreg") : TR("A 注册", "A Reg"), C_ACCENT);
-                        /* ★ v25: 删除提示（危险操作，放第二行靠右） */
-                        draw_text_r(framebuf, lx + lw - 16, iy + 22, 12,
-                                    TR("ZL 删除", "ZL Del"), C_RED);
-                    }
-                    hot_add(lx, iy, lw, row_h - 4, ACT_DLC_PICK, i);
-                }
-                {
-                    char pg[200];
-                    snprintf(pg, sizeof(pg),
-                             TR("共 %d 个   第 %d 项   ↑↓选择  A注册  ZL删除  ZR转格式  [-]删高清贴图",
-                                "Total %d   #%d   Up/Down select  A reg  ZL del  ZR convert  [-] strip HD"),
-                             g_dlc_count, g_dlc_sel + 1);
-                    draw_text(framebuf, lx, ly + vis * row_h + 2, 13, pg, C_TEXT_MUTED);
-                }
-            } else {
-                /* ---- 待导入列表 ---- */
-                int row_h = 50, vis = (LY_BODY_H + 4) / row_h;   /* v6.1: 放开上限 */
-                if (g_dlc_src_sel < 0) g_dlc_src_sel = 0;
-                if (g_dlc_src_sel >= g_dlc_src_count)
-                    g_dlc_src_sel = g_dlc_src_count > 0 ? g_dlc_src_count - 1 : 0;
-                if (g_dlc_src_sel < g_dlc_src_scr) g_dlc_src_scr = g_dlc_src_sel;
-                if (g_dlc_src_sel >= g_dlc_src_scr + vis) g_dlc_src_scr = g_dlc_src_sel - vis + 1;
-                if (g_dlc_src_scr < 0) g_dlc_src_scr = 0;
-
-                if (g_dlc_src_count == 0) {
-                    draw_text(framebuf, lx + 20, ly + 20, 18,
-                              TR("没找到待导入的 dlcpack", "No pending dlcpacks found"), C_ACCENT);
-                    draw_text(framebuf, lx + 20, ly + 52, 15,
-                              TR("把 dlcpack 目录（里面要有 dlc.rpf）放进下面任一目录：",
-                              "Put the dlcpack folder (must contain dlc.rpf) into any of:"), C_TEXT);
-                    const char *hint[] = {
-                        TR("sdmc:/switch/gta5save/dlc/     <- 推荐", "sdmc:/switch/gta5save/dlc/     <- recommended"),
-                        "sdmc:/switch/gta5save/",
-                        "sdmc:/switch/GTA5DLC/",
-                        "sdmc:/dlc/",
-                    };
-                    for (int k = 0; k < 4; k++)
-                        draw_text(framebuf, lx + 40, ly + 82 + k * 24, 14, hint[k], C_TEXT_MUTED);
-                    draw_text(framebuf, lx + 20, ly + 190, 14,
-                              TR("放好后按 Y 键或点下面「重新扫描」", "Then press Y or tap Rescan below"), C_ACCENT);
-                }
-                for (int r = 0; r < vis; r++) {
-                    int i = g_dlc_src_scr + r;
-                    if (i >= g_dlc_src_count) break;
-                    DlcItem *it = &g_dlc_src[i];
-                    int iy = ly + r * row_h;
-                    int sel = (i == g_dlc_src_sel);
-
-                    /* ★ v28: 圆角卡片 + 选中主色条 */
-                    gfx_card(framebuf, lx, iy, lw, row_h - 4, sel ? C_ITEM_SEL : C_CARD, 6);
-                    if (sel) gfx_accent_bar(framebuf, lx + 4, iy + 4, row_h - 12, C_ACCENT);
-
-                    draw_text(framebuf, lx + 18, iy + 5, 17,
-                              it->cn[0] ? it->cn : it->name, C_TEXT);
-                    char n2[240];
-                    /* ★ 源包也检测格式：PC 格式导入时会自动转换（告知用户） */
-                    char srp[700];
-                    int fmt = -1;
-                    if (dlc_src_path_of(it->name, srp, sizeof(srp)) == 0) {
-                        char rp2[760];
-                        snprintf(rp2, sizeof(rp2), "%s/dlc.rpf", srp);
-                        fmt = gc_dlc_is_switch_format(rp2);
-                    }
-                    if (fmt == 0) {
-                        snprintf(n2, sizeof(n2),
-                                 TR("dlc.rpf %u KB   ★ PC 格式 -> 导入时自动转换",
-                                    "dlc.rpf %u KB   * PC format -> auto-converted on import"),
-                                 it->rpf_size / 1024);
-                        draw_text(framebuf, lx + 18, iy + 22, 12, n2, C_ACCENT);
-                    } else if (fmt == 1) {
-                        snprintf(n2, sizeof(n2),
-                                 TR("dlc.rpf %u KB   已是 Switch 格式，可直接导入",
-                                    "dlc.rpf %u KB   already Switch format, ready to import"),
-                                 it->rpf_size / 1024);
-                        draw_text(framebuf, lx + 18, iy + 22, 12, n2, C_GREEN);
-                    } else {
-                        snprintf(n2, sizeof(n2), TR("dlc.rpf %u KB   待导入", "dlc.rpf %u KB   pending"),
-                                 it->rpf_size / 1024);
-                        draw_text(framebuf, lx + 18, iy + 22, 12, n2, C_TEXT_MUTED);
-                    }
-                    /* ★ v32: 第 3 行 -- 资源构成（待导入的 PC 包也能统计） */
-                    {
-                        char n3[220];
-                        if (it->spawn[0])
-                            snprintf(n3, sizeof(n3), TR("模型 %d   地图 %d   贴图 %d   刷车: %s",
-                                      "models %d   map %d   tex %d   spawn: %s"),
-                                     it->n_model, it->n_map, it->n_tex, it->spawn);
-                        else
-                            snprintf(n3, sizeof(n3), TR("模型 %d   地图 %d   贴图 %d",
-                                      "models %d   map %d   tex %d"),
-                                     it->n_model, it->n_map, it->n_tex);
-                        draw_text(framebuf, lx + 18, iy + 35, 11, n3,
-                                  it->spawn[0] ? C_ACCENT : C_TEXT_MUTED);
-                    }
-                    if (sel) {
-                        draw_text_r(framebuf, lx + lw - 16, iy + 5, 14,
-                                    TR("A 导入", "A Import"), C_ACCENT);
-                    }
-                    hot_add(lx, iy, lw, row_h - 4, ACT_DLC_PICK, 1000 + i);
-                }
-                char pg[180];
-                snprintf(pg, sizeof(pg),
-                         TR("待导入 %d 个   第 %d 项   ↑↓选择  A导入  Y已装列表",
-                            "Pending %d   #%d   Up/Down select  A import  Y installed"),
-                         g_dlc_src_count, g_dlc_src_count > 0 ? g_dlc_src_sel + 1 : 0);
-                draw_text(framebuf, lx, ly + vis * row_h + 2, 13, pg, C_TEXT_MUTED);
-            }
-
-            /* ★ v27b: 内容区底部按钮栏已删除（与统一按钮栏 B_DLC 重复），
-             *   行高 44->38，列表 9 行。 */
-
-            /* ★ v25: 删除确认弹窗（画在 DLC 页所有内容之上） */
-            if (g_dlc_confirm) {
-                const char *dname = (g_dlc_sel >= 0 && g_dlc_sel < g_dlc_count)
-                                  ? g_dlc_items[g_dlc_sel].name : "?";
-                int mw = 720, mh = 300;
-                int mx = (FB_WIDTH - mw) / 2, my = (FB_HEIGHT - mh) / 2;
-                /* 遮罩：吃掉弹窗外的所有点击（ACT_NONE 什么都不做） */
-                hot_add(0, 0, FB_WIDTH, my, ACT_NONE, 0);
-                hot_add(0, my + mh, FB_WIDTH, FB_HEIGHT - my - mh, ACT_NONE, 0);
-                hot_add(0, my, mx, mh, ACT_NONE, 0);
-                hot_add(mx + mw, my, FB_WIDTH - mx - mw, mh, ACT_NONE, 0);
-
-                gfx_card(framebuf, mx, my, mw, mh, C_MODAL_BG, 10);
-                draw_text_c(framebuf, FB_WIDTH / 2, my + 22, 24, TR("★ 删除 DLC ?", "* Delete DLC?"), C_RED);
-                char l1[256];
-                snprintf(l1, sizeof(l1), TR("将彻底移除「%s」", "Will completely remove \"%s\""), dname);
-                draw_text_c(framebuf, FB_WIDTH / 2, my + 76, 19, l1, C_TEXT);
-                draw_text_c(framebuf, FB_WIDTH / 2, my + 116, 16,
-                            TR("1. 从 dlclist.xml + extratitleupdatedata.meta 注销（游戏不再加载）",
-                               "1. Unregister from dlclist.xml + extratitleupdatedata.meta (game stops loading it)"),
-                            C_TEXT_MUTED);
-                draw_text_c(framebuf, FB_WIDTH / 2, my + 144, 16,
-                            TR("2. 清空 dlcpacks/<名字>/ 目录", "2. Empty the dlcpacks/<name>/ folder"), C_TEXT_MUTED);
-                draw_text_c(framebuf, FB_WIDTH / 2, my + 184, 15,
-                            TR("★ SD 卡里预先存在的文件可能删不掉，届时请用电脑删除该目录",
-                               "* Pre-existing files on the SD card may not be deletable; remove the folder from a PC if so"),
-                            C_GOLD);
-
-                /* 两个按钮 -- v28: 圆角 */
-                int bw3 = 200, bh3 = 50, gp3 = 40;
-                int bx3 = (FB_WIDTH - (bw3 * 2 + gp3)) / 2, by3 = my + 224;
-                int pa = tap_is_hot(bx3, by3, bw3, bh3);
-                gfx_card(framebuf, bx3, by3, bw3, bh3, pa ? C_CARD_SEL : C_HEADER, 6);
-                draw_text_c(framebuf, bx3 + bw3 / 2, by3 + 13, 20, TR("A 确认删除", "A Delete"),
-                            pa ? 0xFFFFFFFFu : C_RED);
-                hot_add(bx3, by3, bw3, bh3, ACT_CONFIRM, 0);
-
-                int bx4 = bx3 + bw3 + gp3;
-                int pb = tap_is_hot(bx4, by3, bw3, bh3);
-                gfx_card(framebuf, bx4, by3, bw3, bh3, pb ? C_CARD_SEL : C_CARD, 6);
-                draw_text_c(framebuf, bx4 + bw3 / 2, by3 + 13, 20, TR("B 取消", "B Cancel"),
-                            pb ? 0xFFFFFFFFu : C_TEXT);
-                hot_add(bx4, by3, bw3, bh3, ACT_BACK, 0);
-            }
-        }
-        else if (g_tab == TAB_SCRIPT) {
-            /* ================= ★ v5.5 脚本 MOD 独立页 =================
-             * 从 DLC 页第 3 视图提升为顶级页签，并：
-             *   · 自动创建存放目录（用户不用手动建）
-             *   · 页面上明示路径（信息栏 + 空列表时的提示块）
-             *   · 删除功能保留（ZL 键） */
-            int lx = LY_PAD, ly = LY_BODY_Y, lw = LY_CONTENT_R - lx;
-            int row_h = 50;
-            if (g_script_sel < 0) g_script_sel = 0;
-            if (g_script_sel >= g_script_count)
-                g_script_sel = g_script_count > 0 ? g_script_count - 1 : 0;
-            if (g_script_sel < g_script_scr) g_script_scr = g_script_sel;
-            if (g_script_scr < 0) g_script_scr = 0;
-
-            if (g_script_count == 0) {
-                /* ---- 空列表：把「目录在哪、怎么放」讲清楚 ---- */
-                gfx_card(framebuf, lx, ly, lw, 250, C_CARD, 8);
-                draw_text(framebuf, lx + 20, ly + 14, 20,
-                          TR("还没有 .nsc 脚本", "No .nsc scripts yet"), C_ACCENT);
-                draw_text(framebuf, lx + 20, ly + 52, 15,
-                          TR("1. 把 .nsc 脚本文件拷到下面这个目录（本工具已自动创建好）：",
-                          "1. Copy .nsc script files into this folder (auto-created):"), C_TEXT);
-                draw_text(framebuf, lx + 40, ly + 78, 15, SCRIPT_DIR, C_GOLD);
-                draw_text(framebuf, lx + 20, ly + 110, 14,
-                          TR("（也可直接放在 sdmc:/switch/gta5save/ 下，同样能扫到）",
-                          "(You can also drop them in sdmc:/switch/gta5save/ directly)"), C_TEXT_MUTED);
-                draw_text(framebuf, lx + 20, ly + 142, 15,
-                          TR("2. 回到本页按 X 键（或「重新扫描」按钮）", "2. Press X here (or the Rescan button)"), C_TEXT);
-                draw_text(framebuf, lx + 20, ly + 172, 15,
-                          TR("3. ↑↓ 选中脚本 -> 按 A 安装（重启游戏生效）", "3. Up/Down to select -> A to install (reboot to take effect)"), C_TEXT);
-                draw_text(framebuf, lx + 20, ly + 208, 14,
-                          TR("注意：文件名即脚本名，安装时不要改名。", "Note: the file name is the script name; do not rename it."), C_GOLD);
-
-                int bx = lx + 20, by = ly + 262, bw = 200, bh = 48;
-                int pr = tap_is_hot(bx, by, bw, bh);
-                gfx_card(framebuf, bx, by, bw, bh, pr ? C_CARD_SEL : C_HEADER, 6);
-                draw_text_c(framebuf, bx + bw / 2, by + 13, 19, TR("重新扫描", "Rescan"), C_ACCENT);
-                hot_add(bx, by, bw, bh, ACT_SCRIPT_SCAN, 0);
-
-                int bx2 = bx + bw + 16;
-                int pr2 = tap_is_hot(bx2, by, bw, bh);
-                gfx_card(framebuf, bx2, by, bw, bh, pr2 ? C_CARD_SEL : C_CARD, 6);
-                draw_text_c(framebuf, bx2 + bw / 2, by + 13, 19, TR("显示目录信息", "Dir Info"), pr2 ? 0xFFFFFFFFu : C_TEXT);
-                hot_add(bx2, by, bw, bh, ACT_SCRIPT_DIR, 0);
-            } else {
-                /* ★ v5.6: 顶部一条 RPF 实况栏 —— 让「装没装」一眼可见 */
-                int y = ly;
-                if (g_script_rpf_n < 0) {
-                    gfx_card(framebuf, lx, y, lw, 40, C_CARD, 6);
-                    gfx_rect(framebuf, lx + 2, y + 2, 5, 36, C_RED);
-                    draw_text(framebuf, lx + 18, y + 11, 15,
-                              TR("[!] 读 update2.rpf 失败 -> 下面的「已装/未装」不可信",
-                              "[!] Failed to read update2.rpf -> installed status below is unreliable"), C_RED);
-                    y += 46;
-                } else {
-                    int ninst_r = 0;
-                    for (int i = 0; i < g_script_count; i++)
-                        if (g_script_items[i].installed) ninst_r++;
-                    gfx_card(framebuf, lx, y, lw, 38, C_CARD, 6);
-                    gfx_rect(framebuf, lx + 2, y + 2, 5, 34,
-                             ninst_r > 0 ? C_GREEN : C_TEXT_MUTED);
-                    char st[260];
-                    snprintf(st, sizeof(st),
-                             TR("update2.rpf 内的 script_rel.rpf 读到 %d 个 .nsc 条目   本列表 %d 个，已装 %d 个",
-                                "script_rel.rpf in update2.rpf: %d .nsc entries   local list %d, installed %d"),
-                             g_script_rpf_n, g_script_count, ninst_r);
-                    draw_text(framebuf, lx + 18, y + 10, 14, st, C_TEXT);
-                    y += 44;
-                }
-                /* ★ v5.7: 页内目录信息面板（按 Y 或点「目录信息」开关） */
-                if (g_script_dirinfo_on) {
-                    const char *p = g_script_dirinfo;
-                    int lines = 1;
-                    for (const char *q = p; *q; q++) if (*q == '\n') lines++;
-                    int ph = 8 + lines * 24;
-                    gfx_card(framebuf, lx, y, lw, ph,
-                             g_script_dirinfo_ok ? C_CARD : C_MODAL_BG, 6);
-                    gfx_rect(framebuf, lx + 2, y + 2, 5, ph - 4,
-                             g_script_dirinfo_ok ? C_ACCENT : C_RED);
-                    int ly3 = y + 6;
-                    char tmp[512];
-                    snprintf(tmp, sizeof(tmp), "%s", p);
-                    char *save = tmp;
-                    for (char *ln = tmp; ; ln++) {
-                        if (*ln == '\n' || *ln == 0) {
-                            char keep = *ln;
-                            *ln = 0;
-                            draw_text(framebuf, lx + 18, ly3, 15, save,
-                                      g_script_dirinfo_ok ? C_TEXT : C_RED);
-                            ly3 += 24;
-                            if (keep == 0) break;
-                            save = ln + 1;
-                        }
-                    }
-                    y += ph + 6;
-                }
-                int ly2 = y;                        /* 列表起点下移 */
-                int vis2 = (LY_BODY_H - (ly2 - ly)) / row_h;
-                if (vis2 < 1) vis2 = 1;
-                if (g_script_sel >= g_script_scr + vis2)
-                    g_script_scr = g_script_sel - vis2 + 1;
-                if (g_script_scr < 0) g_script_scr = 0;
-
-                for (int r = 0; r < vis2; r++) {
-                    int i = g_script_scr + r;
-                    if (i >= g_script_count) break;
-                    ScriptItem *it = &g_script_items[i];
-                    int iy = ly2 + r * row_h;
-                    int sel = (i == g_script_sel);
-                    gfx_card(framebuf, lx, iy, lw, row_h - 4, sel ? C_ITEM_SEL : C_CARD, 6);
-                    if (sel) gfx_accent_bar(framebuf, lx + 4, iy + 4, row_h - 12, C_ACCENT);
-
-                    /* 状态点：绿=RPF 里已装，灰=未装，红=读取失败 */
-                    uint32_t dotc = (g_script_rpf_n < 0) ? C_RED
-                                  : (it->installed ? C_GREEN : C_TEXT_MUTED);
-                    gfx_dot(framebuf, lx + 18, iy + 14, 5, dotc);
-                    draw_text(framebuf, lx + 34, iy + 5, 17, it->name,
-                              it->installed ? C_GREEN : C_TEXT);
-
-                    char b[240];
-                    /* ★ v6.2: 统一用 fmt_size —— 原来 `size / 1024` 整数除法会把
-                     *   927 B 的 error_listener.nsc 显示成「0 KB」（用户实机反馈）。 */
-                    char szs[24];
-                    fmt_size(szs, sizeof(szs), it->size);
-                    if (!script_file_usable(it->size))
-                        snprintf(b, sizeof(b),
-                                 TR("%u B   [!] 文件无效（0 字节或过大），不能安装%s",
-                                    "%u B   [!] invalid file (zero or too large), cannot install%s"),
-                                 it->size,
-                                 it->from_alt ? TR("  [兼容目录]", "  [compat dir]") : "");
-                    else if (g_script_rpf_n < 0)
-                        snprintf(b, sizeof(b), TR("%s   [状态未知：RPF 读取失败]%s", "%s   [status unknown: RPF read failed]%s"),
-                                 szs,
-                                 it->from_alt ? TR("  [兼容目录]", "  [compat dir]") : "");
-                    else
-                        snprintf(b, sizeof(b), TR("%s   %s%s", "%s   %s%s"), szs,
-                                 it->installed ? TR("RPF 里已有 -> 再装将替换", "in RPF -> reinstall replaces")
-                                               : TR("RPF 里没有 -> 按 A 装", "not in RPF -> press A to install"),
-                                 it->from_alt ? TR("   [来自 gta5save 兼容目录]", "   [from gta5save compat dir]") : "");
-                    draw_text(framebuf, lx + 34, iy + 27, 12, b,
-                              (!script_file_usable(it->size)) ? C_RED
-                            : (it->installed ? C_TEXT_MUTED : C_TEXT));
-
-                    /* 右侧：状态徽标 */
-                    if (!script_file_usable(it->size)) {
-                        draw_text_r(framebuf, lx + lw - 16, iy + 5, 14, TR("文件无效", "Invalid"), C_RED);
-                    } else if (g_script_rpf_n < 0) {
-                        draw_text_r(framebuf, lx + lw - 16, iy + 5, 14, TR("状态未知", "Unknown"), C_RED);
-                    } else if (it->installed) {
-                        draw_text_r(framebuf, lx + lw - 130, iy + 5, 15, TR("[已装]", "[Installed]"), C_GREEN);
-                        if (sel)
-                            draw_text_r(framebuf, lx + lw - 16, iy + 5, 13, TR("ZL 删除", "ZL Del"), C_RED);
-                    } else {
-                        draw_text_r(framebuf, lx + lw - 130, iy + 5, 15, TR("[未装]", "[Not installed]"), C_TEXT_MUTED);
-                        if (sel)
-                            draw_text_r(framebuf, lx + lw - 16, iy + 5, 14, TR("A 安装", "A Install"), C_ACCENT);
-                    }
-                    hot_add(lx, iy, lw, row_h - 4, ACT_SCRIPT_INSTALL, 1000 + i);
-                }
-                {
-                    char pg[300];
-                    /* ★ v5.7: 拆两行 —— 原来一行塞了路径+按键，末尾会被截断 */
-                    snprintf(pg, sizeof(pg),
-                             TR("共 %d 个脚本   第 %d 项   ↑↓选择   A安装/替换   ZL删除   X重扫   Y目录",
-                                "%d scripts   #%d   Up/Down select   A install   ZL del   X rescan   Y dir"),
-                             g_script_count, g_script_sel + 1);
-                    draw_text(framebuf, lx, ly + LY_BODY_H - 30, 12, pg, C_TEXT_MUTED);
-                    draw_text(framebuf, lx, ly + LY_BODY_H - 15, 11,
-                              TR("底部「★模组管理」= 还原官方脚本 / 内置模组一键安装（含原作者署名）",
-                                 "Bottom \"*Mod Mgr\" = restore stock scripts / one-tap builtin mods (authors credited)"),
-                              C_ACCENT);
-                }
-            }
-        }
-        else {
-            int lx = LY_PAD, ly = LY_BODY_Y, lw = FB_WIDTH - LY_PAD * 2;
-            gfx_card(framebuf, lx, ly, lw, 150, C_CARD, 8);
-            draw_text(framebuf, lx + 20, ly + 14, 18, TR("存档信息", "Save Info"), C_ACCENT);
-            {
-                char b1[512], b2[512];
-                snprintf(b1, sizeof(b1), TR("路径: %s", "Path: %s"), g_save_path);
-                snprintf(b2, sizeof(b2), TR("大小: %zu KB   槽位: %d 个   备份: %d 个   来源: %s",
-              "Size: %zu KB   slots: %d   backups: %d   source: %s"),
-                         g_save_sz / 1024, g_num_slots, g_num_backups,
-                         g_is_native_mount ? TR("系统内部直读", "system direct") : TR("SD 卡目录", "SD card dir"));
-                draw_text(framebuf, lx + 20, ly + 46, 15, b1, C_TEXT);
-                draw_text(framebuf, lx + 20, ly + 74, 15, b2, C_TEXT_MUTED);
-                draw_text(framebuf, lx + 20, ly + 102, 14,
-                          TR("提示：画质文件与存档同目录，游戏读取的就是 save:/settings.xml",
-              "note: gfx file sits next to the save; the game reads save:/settings.xml"), C_TEXT_MUTED);
-            }
-
-            /* 功能按钮 2 行 */
-            {
-                struct { const char *t; int act; } BTN[8] = {
-                    { TR("内置存档库", "Save Presets"), ACT_LOAD_PRESET },
-                    { TR("历史备份库", "Backups"),      ACT_LOAD_BACKUP },
-                    { TR("切换槽位",   "Switch Slot"),  ACT_PICK_SLOT },
-                    { TR("画质预设",   "GFX Preset"),   ACT_GFX_PRESET },
-                    { TR("导入画质",   "Import GFX"),   ACT_GFX_IMPORT },
-                    { TR("路径自检",   "Self-test"),    ACT_GFX_CHECK },
-                    { TR("保存写回",   "Save"),         ACT_SAVE },
-                    { TR("保存并退出", "Save & Exit"),  ACT_QUIT },
-                };
-                int bw = 276, bh = 50, bgx = LY_PAD, bgy = 330, bgp = 20;
-                for (int b = 0; b < 8; b++) {
-                    int bx = bgx + (b % 4) * (bw + bgp);
-                    int by = bgy + (b / 4) * (bh + 14);
-                    gfx_card(framebuf, bx, by, bw, bh, C_CARD, 6);
-                    draw_text_c(framebuf, bx + bw / 2, by + 14, 19, BTN[b].t, C_TEXT);
-                    hot_add(bx, by, bw, bh, BTN[b].act, 0);
-                }
-            }
-        }
-
-        /* =====================================================================
-         * 7. ★ v28b: 底部 −/+ 大按钮区【整体删除】（用户反馈占空间）
-         *    调数值改用：ZL/ZR 物理键（原有）+ 列表行内小 ±（渲染在选中行右侧）
-         *    腾出的空间让内容区列表更舒展
-         * ===================================================================== */
-
-        /* =====================================================================
-         * 8. 统一按钮栏（可点）-- ★ v5: 按页签切换按钮组, 不再出现"点了没反应"
-         *    且左右两组各自留够宽度, 彻底消除原「保存写回 / 保存并退出」完全重叠
-         * ===================================================================== */
-        {
-            int by = LY_BTN_Y, bh = LY_BTN_H;
-
-            /* 按页签取不同按钮组 (每组 4 个)
-             * ★ v5: 角色切换已由顶部可点标签栏承担, 这里换成更实用的 4 个动作 */
-            struct BtnDef { const char *t; int act; };
-            /* ★ v6.3: static 初始化器不能用 TR()（运行时值）⇒ 首帧填一次 */
-            static struct BtnDef B_SAVE[4], B_GFX[4], B_TOOL[4],
-                                 B_PERF[5], B_DLC[5],  B_SCRIPT[5];
-            static int btn_inited = 0;
-            if (!btn_inited) {
-                const struct BtnDef zh_save[4] = {
-                    { "拉满当前", ACT_MAX_ALL }, { "角色全满", ACT_MAX_CHAR },
-                    { "切换步长", ACT_CYCLE_STEP }, { "切换槽位", ACT_PICK_SLOT },
-                };
-                const struct BtnDef en_save[4] = {
-                    { "Max All", ACT_MAX_ALL }, { "Max Char", ACT_MAX_CHAR },
-                    { "Step Size", ACT_CYCLE_STEP }, { "Slot", ACT_PICK_SLOT },
-                };
-                const struct BtnDef zh_gfx[4] = {
-                    { "上一项", ACT_NAV_UP }, { "下一项", ACT_NAV_DOWN },
-                    { "翻到顶", ACT_SCROLL_TOP }, { "翻到底", ACT_SCROLL_BOTTOM },
-                };
-                const struct BtnDef en_gfx[4] = {
-                    { "Prev", ACT_NAV_UP }, { "Next", ACT_NAV_DOWN },
-                    { "Top", ACT_SCROLL_TOP }, { "Bottom", ACT_SCROLL_BOTTOM },
-                };
-                const struct BtnDef zh_tool[4] = {
-                    { "内置存档库", ACT_LOAD_PRESET }, { "历史备份库", ACT_LOAD_BACKUP },
-                    { "画质预设", ACT_GFX_PRESET }, { "导入画质", ACT_GFX_IMPORT },
-                };
-                const struct BtnDef en_tool[4] = {
-                    { "Save Presets", ACT_LOAD_PRESET }, { "Backups", ACT_LOAD_BACKUP },
-                    { "GFX Preset", ACT_GFX_PRESET }, { "Import GFX", ACT_GFX_IMPORT },
-                };
-                const struct BtnDef zh_perf[5] = {
-                    { "重新载入", ACT_GC_LOAD }, { "上一组", ACT_GC_GROUP_PREV },
-                    { "下一组", ACT_GC_GROUP_NEXT }, { "恢复原版", ACT_GC_RESTORE },
-                    { "回读校验", ACT_GC_VERIFY },
-                };
-                const struct BtnDef en_perf[5] = {
-                    { "Reload", ACT_GC_LOAD }, { "Prev Group", ACT_GC_GROUP_PREV },
-                    { "Next Group", ACT_GC_GROUP_NEXT }, { "Restore", ACT_GC_RESTORE },
-                    { "Verify", ACT_GC_VERIFY },
-                };
-                const struct BtnDef zh_dlc[5] = {
-                    { "重新扫描", ACT_DLC_SCAN_SRC }, { "注册/注销", ACT_DLC_TOGGLE },
-                    { "模型目录", ACT_OPEN_MODELDIR }, { "★转格式", ACT_DLC_CONVERT },
-                    { "切换列表", ACT_DLC_VIEW },
-                };
-                const struct BtnDef en_dlc[5] = {
-                    { "Rescan", ACT_DLC_SCAN_SRC }, { "Register", ACT_DLC_TOGGLE },
-                    { "Model Dir", ACT_OPEN_MODELDIR }, { "*Convert", ACT_DLC_CONVERT },
-                    { "Switch View", ACT_DLC_VIEW },
-                };
-                const struct BtnDef zh_script[5] = {
-                    { "重新扫描", ACT_SCRIPT_SCAN }, { "★安装", ACT_SCRIPT_INSTALL },
-                    { "★删除", ACT_SCRIPT_UNINSTALL }, { "目录信息", ACT_SCRIPT_DIR },
-                    { "★模组管理", ACT_SCRIPT_MGR },
-                };
-                const struct BtnDef en_script[5] = {
-                    { "Rescan", ACT_SCRIPT_SCAN }, { "*Install", ACT_SCRIPT_INSTALL },
-                    { "*Delete", ACT_SCRIPT_UNINSTALL }, { "Dir Info", ACT_SCRIPT_DIR },
-                    { "*Mod Mgr", ACT_SCRIPT_MGR },
-                };
-                memcpy(B_SAVE,   g_lang_en ? en_save   : zh_save,   sizeof(B_SAVE));
-                memcpy(B_GFX,    g_lang_en ? en_gfx    : zh_gfx,    sizeof(B_GFX));
-                memcpy(B_TOOL,   g_lang_en ? en_tool   : zh_tool,   sizeof(B_TOOL));
-                memcpy(B_PERF,   g_lang_en ? en_perf   : zh_perf,   sizeof(B_PERF));
-                memcpy(B_DLC,    g_lang_en ? en_dlc    : zh_dlc,    sizeof(B_DLC));
-                memcpy(B_SCRIPT, g_lang_en ? en_script : zh_script, sizeof(B_SCRIPT));
-                btn_inited = 1;
-            }
-            const struct BtnDef *B = (g_tab == TAB_GFX) ? B_GFX
-                                    : (g_tab == TAB_TOOL) ? B_TOOL
-                                    : (g_tab == TAB_PERF) ? B_PERF
-                                    : (g_tab == TAB_DLC)  ? B_DLC
-                                    : (g_tab == TAB_SCRIPT) ? B_SCRIPT : B_SAVE;
-
-            /* 左区按钮：按页签取组
-             * ★ v6.2: 脚本页回到 5 个（模组管理合并了原来的两个还原入口）。 */
-            int nbtn = (g_tab == TAB_PERF || g_tab == TAB_DLC) ? 5
-                     : (g_tab == TAB_SCRIPT) ? 5 : 4;
-            int right_x0 = FB_WIDTH - LY_PAD - 290;      /* 右区起点 */
-            int avail = right_x0 - LY_PAD - 12;          /* 左区可用宽（留 12 间隔）*/
-            int gp = 12;
-            int bw = (avail - (nbtn - 1) * gp) / nbtn;
-            if (bw > 200) bw = 200;
-            int x0 = LY_PAD;
-            for (int b = 0; b < nbtn; b++) {
-                int bx = x0 + b * (bw + gp);
-                int pressed = tap_is_hot(bx, by, bw, bh);   /* ★ v24 点击反馈 */
-                /* ★ v28: 圆角按钮无描边，按下 = 主色块 */
-                gfx_card(framebuf, bx, by, bw, bh, pressed ? C_CARD_SEL : C_CARD, 6);
-                /* ★ v6: 脚本页 6 个按钮宽度变窄 ⇒ 字号自适应，长文案才不会溢出 */
-                int fs = (bw >= 170) ? 19 : (bw >= 120 ? 16 : 14);
-                draw_text_c(framebuf, bx + bw / 2, by + 13, fs, B[b].t,
-                            pressed ? C_ACCENT : C_TEXT);
-                hot_add(bx, by, bw, bh, B[b].act, 0);
-            }
-            /* 右区: 写入 + 退出 (两枚, 各 140 宽, 不重叠) */
-            {
-                int bw2 = 140, gp2 = 10;
-                int bx1 = FB_WIDTH - LY_PAD - (bw2 * 2 + gp2);
-                int bx2 = FB_WIDTH - LY_PAD - bw2;
-
-                const char *t1 = (g_tab == TAB_PERF) ? TR("写入rpf", "Write RPF")
-                               : (g_tab == TAB_DLC)  ? TR("导入选中", "Import")
-                               : (g_tab == TAB_SCRIPT) ? TR("装/替换", "Install") : TR("保存写回", "Save");
-                const char *t2 = (g_tab == TAB_PERF) ? TR("返回", "Back")
-                               : (g_tab == TAB_DLC)  ? TR("返回", "Back")
-                               : (g_tab == TAB_SCRIPT) ? TR("返回", "Back")    : TR("保存退出", "Save+Exit");
-                int a1 = (g_tab == TAB_PERF) ? ACT_GC_WRITE
-                       : (g_tab == TAB_DLC)  ? ACT_DLC_IMPORT
-                       : (g_tab == TAB_SCRIPT) ? ACT_SCRIPT_INSTALL : ACT_SAVE;
-                int a2 = (g_tab == TAB_PERF) ? ACT_BACK
-                       : (g_tab == TAB_DLC)  ? ACT_BACK
-                       : (g_tab == TAB_SCRIPT) ? ACT_BACK        : ACT_QUIT;
-
-                int hot1 = ((g_tab == TAB_PERF && !g_gc_opened) ||
-                            (g_tab == TAB_DLC && (g_dlc_view == 0 || !g_dlc_xml_loaded)) ||
-                            (g_tab == TAB_SCRIPT && g_script_count == 0)) ? 1 : 0;
-                int pr1 = tap_is_hot(bx1, by, bw2, bh);      /* ★ v24 点击反馈 */
-                int pr2 = tap_is_hot(bx2, by, bw2, bh);
-                if (pr1) hot1 = 1;
-                gfx_card(framebuf, bx1, by, bw2, bh, hot1 ? C_HEADER : C_CARD, 6);
-                draw_text_c(framebuf, bx1 + bw2 / 2, by + 13, 19, t1,
-                            hot1 ? C_ACCENT : C_TEXT);
-                hot_add(bx1, by, bw2, bh, a1, 0);
-
-                gfx_card(framebuf, bx2, by, bw2, bh, pr2 ? C_CARD_SEL : C_HEADER, 6);
-                draw_text_c(framebuf, bx2 + bw2 / 2, by + 13, 19, t2,
-                            pr2 ? 0xFFFFFFFFu : C_ACCENT);
-                hot_add(bx2, by, bw2, bh, a2, 0);
-            }
-        }
-
-        /* 9. 操作结果提示栏 */
-        {
-            int ry = LY_HINT_Y;
-            const char *msg = g_status_msg;
-            uint32_t msgc = g_status_color;
-            int dirty = (g_tab == TAB_GFX) ? g_gfx_dirty : g_dirty;
-
-            if (g_tab == TAB_PERF) {
-                /* 性能页用自己的状态消息 */
-                msg = g_gc_msg;
-                msgc = g_gc_msg_color;
-                dirty = g_gc_dirty;
-            } else if (g_tab == TAB_DLC) {
-                msg = g_dlc_msg[0] ? g_dlc_msg : TR("点「载入并扫描」开始", "Press Load & Scan to start");
-                /* ★ v5.7: 失败必须是红色 —— 原来用 C_ACCENT(蓝)，错误信息看起来像普通提示 */
-                msgc = g_dlc_msg_ok ? C_GREEN : C_RED;
-                dirty = g_dlc_dirty;
-            } else if (g_tab == TAB_SCRIPT) {
-                msg = g_dlc_msg[0] ? g_dlc_msg
-                                   : TR("把 .nsc 放进下面的目录 -> 按 X 扫描 -> 选 A 安装",
-                                        "Put .nsc files in the folder below -> X to scan -> A to install");
-                msgc = g_dlc_msg_ok ? C_GREEN : C_RED;   /* ★ v5.7: 同上 */
-                dirty = 0;
-            }
-            if (dirty) {
-                int x = LY_PAD;
-                x = draw_text(framebuf, x, ry, 16, TR("[有未保存修改] ", "[Unsaved] "), C_GOLD);
-                draw_text(framebuf, x, ry, 16, msg, msgc);
-            } else {
-                draw_text(framebuf, LY_PAD, ry, 16, msg, msgc);
-            }
-            {
-                const char *hint;
-                if (g_tab == TAB_PERF) {
-                    if (!g_gc_opened)
-                        hint = TR("A 载入 update.rpf   B 返回DLC页   L/R 换页",
-                         "A load update.rpf   B back   L/R switch tab");
-                    else
-                        hint = TR("↑/↓ 选参数   <-/-> 增减   ZL/ZR 大步(可长按)   Y 恢复原版   X 写入rpf   B 返回DLC页   L/R 换页",
-                         "Up/Down param   Left/Right value   ZL/ZR big step (hold)   Y restore   X write RPF   B back   L/R tab");
-                }
-                else if (g_tab == TAB_GFX)
-                    hint = TR("↑/↓ 选项   ZL/ZR 调值(可长按)   A 保存   Y 预设   B 返回DLC页",
-                         "Up/Down item   ZL/ZR adjust (hold)   A save   Y preset   B back");
-                else if (g_tab == TAB_DLC) {
-                    if (!g_dlc_xml_loaded)
-                        hint = TR("A 载入并扫描   L/R 换页", "A load & scan   L/R switch tab");
-                    else if (g_dlc_view == 0)
-                        hint = TR("↑/↓ 选包   A 注册/注销   ZR 转格式   ZL 删除   Y 待导入   B 返回主页   L/R 换页",
-                         "Up/Down pack   A register   ZR convert   ZL delete   Y pending   B back   L/R tab");
-                    else
-                        hint = TR("↑/↓ 选待导入项   A 导入   Y 已装列表   B 返回已装   L/R 换页",
-                         "Up/Down item   A import   Y installed   B back   L/R tab");
-                }
-                else if (g_tab == TAB_SCRIPT)
-                    hint = TR("↑/↓ 选脚本   A 安装/替换   ZL 删除   X 重扫   Y 目录信息   B 返回DLC页   L/R 换页",
-                         "Up/Down script   A install   ZL delete   X rescan   Y dir info   B back   L/R tab");
-                else if (g_tab == TAB_TOOL)
-                    hint = TR("点按钮执行功能   B 返回DLC页   L/R 换页", "Tap buttons to run   B back   L/R switch tab");
-                else
-                    hint = TR("A 保存   B 返回DLC页   X 拉满   Y 步长   ZL/ZR 调值(可长按)   - 角色全满",
-                         "A save   B back   X max   Y step   ZL/ZR adjust (hold)   - max char");
-                draw_text(framebuf, LY_PAD, ry + 24, 14, hint, C_TEXT_MUTED);
-            }
-        }
-
-        /* 11. ★ v8 路径自检报告（全屏覆盖，方便上机排查）
-         *   🚨 关键：不能就地改 g_gc_selftest（把 \n 换成 \0）！
-         *   渲染每帧都跑，第一帧就把换行全毁掉 ⇒ 之后只画一行就 break。
-         *   （踩过：报告只显示了「sdmc 挂载」一行）
-         *   改为把每行拷进临时缓冲再画。 */
-        if (g_gc_selftest_show && g_gc_selftest[0]) {
-            gfx_card(framebuf, 50, 30, FB_WIDTH - 100, FB_HEIGHT - 60, C_MODAL_BG, 14);
-            draw_text(framebuf, 76, 44, 22, TR("路径自检报告 (update.rpf)", "Path self-test (update.rpf)"), C_ACCENT);
-
-            int y = 80;
-            const char *p = g_gc_selftest;
-            char line[256];
-            while (*p && y < FB_HEIGHT - 62) {
-                const char *nl = strchr(p, '\n');
-                size_t n = nl ? (size_t)(nl - p) : strlen(p);
-                if (n >= sizeof(line)) n = sizeof(line) - 1;
-                memcpy(line, p, n);
-                line[n] = '\0';
-
-                uint32_t c = C_TEXT;
-                if (strstr(line, TR("[有]", "[yes]")))          c = C_GREEN;
-                else if (strstr(line, TR("[无]", "[no]")))     c = C_TEXT_MUTED;
-                else if (strstr(line, TR("[打不开]", "[cannot open]"))) c = C_RED;
-                else if (strstr(line, "B]"))       c = C_GREEN;
-                else if (strstr(line, "rc="))      c = C_BLUE;
-                else if (strstr(line, "★"))        c = C_RED;
-                else if (strstr(line, "(OK)") || strstr(line, TR("(成功)", "(ok)"))) c = C_GREEN;
-                else if (line[0] == 0)             c = C_TEXT_MUTED;
-
-                if (line[0]) draw_text(framebuf, 76, y, 13, line, c);
-                y += 17;
-                if (!nl) break;
-                p = nl + 1;
-            }
-            draw_text(framebuf, 76, FB_HEIGHT - 52, 16, TR("按任意键 / 点屏幕关闭", "press any key / tap to close"), C_BORDER_SEL);
-        }
-
-        if (g_gc_confirm) {
-            gfx_card(framebuf, 240, 200, FB_WIDTH - 480, 320, C_MODAL_BG, 14);
-            if (g_gc_confirm == 1) {
-                draw_text_c(framebuf, FB_WIDTH / 2, 232, 24, TR("确认写入 update.rpf ?", "Write to update.rpf?"), C_ACCENT);
-                draw_text_c(framebuf, FB_WIDTH / 2, 286, 17,
-                            TR("将把改动写进 889 MB 的 update.rpf", "will write changes into the 889 MB update.rpf"), C_TEXT);
-                char l2[160];
-                snprintf(l2, sizeof(l2), TR("switch 段 %d 项, 已改 %d 项", "switch section %d items, %d edited"),
-                         g_gc_n_switch, g_gc_edited_n);
-                draw_text_c(framebuf, FB_WIDTH / 2, 316, 16, l2, C_TEXT_MUTED);
-                draw_text_c(framebuf, FB_WIDTH / 2, 350, 16,
-                            TR("采用纯字节原位替换：文件大小不变、其它条目零改动",
-                            "in-place byte replacement: file size unchanged, other entries untouched"), C_GREEN);
-                draw_text_c(framebuf, FB_WIDTH / 2, 380, 16,
-                            TR("写入后会立即校验，失败自动回滚", "verified immediately after write, auto-rollback on failure"), C_GREEN);
-                draw_text_c(framebuf, FB_WIDTH / 2, 424, 18,
-                            TR("A 确认写入      B 取消", "A write      B cancel"), C_BORDER_SEL);
-            } else {
-                draw_text_c(framebuf, FB_WIDTH / 2, 232, 24, TR("恢复原版参数 ?", "Restore original params?"), C_ACCENT);
-                draw_text_c(framebuf, FB_WIDTH / 2, 286, 17,
-                            TR("把全部 52 项参数恢复成移植作者的原始值", "restore all 52 params to the porter's original values"), C_TEXT);
-                draw_text_c(framebuf, FB_WIDTH / 2, 316, 16,
-                            TR("（无论当前是哪一档，都能正确还原；之后需点「写入rpf」落盘）",
-                            "(works from any preset; press Write RPF afterwards to commit)"),
-                            C_TEXT_MUTED);
-                draw_text_c(framebuf, FB_WIDTH / 2, 424, 18,
-                            TR("A 确认恢复      B 取消", "A restore      B cancel"), C_BORDER_SEL);
-            }
-        }
-
-        /* ---------------- 模态弹窗 1：内置通关进度库 (ZL) ---------------- */
-        if (g_modal_mode == 1) {
-            gfx_card(framebuf, 80, 50, FB_WIDTH - 160, FB_HEIGHT - 100, C_MODAL_BG, 14);
-            
-            draw_text(framebuf, 120, 75, 24, TR("[内置] 游戏剧情通关进度存档库 (A 键载入内存，再按 A 写入游戏)",
-                                     "[Builtin] Story progress saves (A to load into memory, A again to write)"), C_ACCENT);
-            draw_text(framebuf, 120, 110, 16, TR("上下键 选择剧情节点 | A键 载入 | B键 取消返回",
-                              "Up/Down story node | A load | B back"), C_TEXT_MUTED);
-
-            int item_y = 145;
-            for (int p = 0; p < (int)NUM_PRESETS; p++) {
-                int is_p_sel = (p == g_modal_sel);
-                gfx_card(framebuf, 120, item_y, FB_WIDTH - 240, 75, is_p_sel ? C_CARD_SEL : C_CARD, 8);
-                if (is_p_sel) gfx_accent_bar(framebuf, 124, item_y + 6, 63, C_ACCENT);
-
-                draw_text(framebuf, 140, item_y + 14, 22, PRESET_SAVE(p).name, is_p_sel ? C_ACCENT : C_TEXT);
-                draw_text(framebuf, 140, item_y + 44, 16, PRESET_SAVE(p).desc, C_TEXT_MUTED);
-
-                if (is_p_sel) {
-                    draw_text(framebuf, FB_WIDTH - 250, item_y + 26, 18, TR("> 按 A 键载入", "> press A to load"), C_ACCENT);
-                }
-                item_y += 85;
-            }
-        }
-
-        /* ---------------- 模态弹窗 2：历史备份库 (/switch/gta5save/) (ZR) ---------------- */
-        if (g_modal_mode == 2) {
-            gfx_card(framebuf, 80, 50, FB_WIDTH - 160, FB_HEIGHT - 100, C_MODAL_BG, 14);
-            
-            draw_text(framebuf, 120, 75, 24, TR("[备份库] 历史备份存档管理器 (直接读取备份存档的剧情名与时间戳)",
-                                     "[Backups] Backup save manager (reads story name & timestamp)"), C_BLUE);
-            draw_text(framebuf, 120, 110, 16, TR("上下键 选择历史快照 | A键 恢复此备份进内存 | B键 取消返回",
-                              "Up/Down snapshot | A restore to memory | B back"), C_TEXT_MUTED);
-
-            if (g_num_backups == 0) {
-                draw_text(framebuf, 140, 200, 22, TR("暂无历史备份文件! 每次在主界面按 A 键保存时系统会自动创建安全备份。",
-                          "No backups yet! A safety backup is created automatically each time you save with A."), C_TEXT_MUTED);
-            } else {
-                int item_y = 145;
-                int start_i = 0;
-                if (g_modal_sel >= 5) start_i = g_modal_sel - 4;
-                int end_i = start_i + 5;
-                if (end_i > g_num_backups) end_i = g_num_backups;
-
-                for (int b = start_i; b < end_i; b++) {
-                    int is_b_sel = (b == g_modal_sel);
-                    gfx_card(framebuf, 120, item_y, FB_WIDTH - 240, 75, is_b_sel ? C_CARD_SEL : C_CARD, 8);
-                    if (is_b_sel) gfx_accent_bar(framebuf, 124, item_y + 6, 63, C_BLUE);
-
-                    char title_line[256];
-                    const char *b_title = g_backups[b].title[0] ? g_backups[b].title : TR("未知剧情标题", "Unknown story title");
-                    snprintf(title_line, sizeof(title_line), TR("快照: %s  [%s]", "Snapshot: %s  [%s]"), g_backups[b].dir_name, b_title);
-                    draw_text(framebuf, 140, item_y + 14, 20, title_line, is_b_sel ? C_ACCENT : C_TEXT);
-
-                    char sub_line[256];
-                    snprintf(sub_line, sizeof(sub_line), TR("备份原因: %s  (大小: %zu KB)", "Reason: %s  (size: %zu KB)"), g_backups[b].note, g_backups[b].size / 1024);
-                    draw_text(framebuf, 140, item_y + 44, 15, sub_line, C_TEXT_MUTED);
-
-                    if (is_b_sel) {
-                        draw_text(framebuf, FB_WIDTH - 250, item_y + 26, 18, TR("> 按 A 恢复", "> press A to restore"), C_BLUE);
-                    }
-                    hot_add(120, item_y, FB_WIDTH - 240, 85, ACT_PICK_ITEM, b);   /* ★ v4 触屏点选备份 */
-                    item_y += 85;
-                }
-
-                char page_info[64];
-                snprintf(page_info, sizeof(page_info), TR("共 %d 个备份，当前第 %d 项", "%d backups, #%d"), g_num_backups, g_modal_sel + 1);
-                draw_text(framebuf, 120, FB_HEIGHT - 80, 16, page_info, C_TEXT_MUTED);
-            }
-        }
-
-        /* ---------------- 模态弹窗 3：选择当前目录存档槽位 (B) ---------------- */
-        if (g_modal_mode == 3) {
-            gfx_card(framebuf, 80, 50, FB_WIDTH - 160, FB_HEIGHT - 100, C_MODAL_BG, 14);
-            
-            draw_text(framebuf, 120, 75, 24, TR("[槽位选择] 当前游戏目录中的所有存档 (已显示剧情任务与进度时间)",
-                                     "[Slots] All saves in the game folder (story mission & time shown)"), C_GREEN);
-            draw_text(framebuf, 120, 110, 16, TR("默认已选中最近修改的存档 | 上下键 挑选槽位 | A键 确认切换 | B键 返回",
-                              "most recent preselected | Up/Down pick slot | A confirm | B back"), C_TEXT_MUTED);
-
-            if (g_num_slots == 0) {
-                draw_text(framebuf, 140, 200, 22, TR("当前目录下未检测到任何 SGTA5* 存档文件!", "No SGTA5* save files found in this folder!"), C_RED);
-            } else {
-                int item_y = 145;
-                int start_i = 0;
-                if (g_modal_sel >= 5) start_i = g_modal_sel - 4;
-                int end_i = start_i + 5;
-                if (end_i > g_num_slots) end_i = g_num_slots;
-
-                for (int s = start_i; s < end_i; s++) {
-                    int is_s_sel = (s == g_modal_sel);
-                    int is_active = (s == g_active_slot_idx);
-
-                    gfx_card(framebuf, 120, item_y, FB_WIDTH - 240, 75, is_s_sel ? C_CARD_SEL : C_CARD, 8);
-                    if (is_s_sel || is_active)
-                        gfx_accent_bar(framebuf, 124, item_y + 6, 63, is_active ? C_GREEN : C_ACCENT);
-
-                    char line1[256];
-                    const char *slot_title = g_slots[s].title[0] ? g_slots[s].title : TR("未知剧情标题", "Unknown story title");
-                    snprintf(line1, sizeof(line1), "%s:  %s  %s", g_slots[s].filename, slot_title, is_active ? TR("[当前正在编辑]", "[currently editing]") : "");
-                    draw_text(framebuf, 140, item_y + 14, 20, line1, is_active ? C_GREEN : (is_s_sel ? C_ACCENT : C_TEXT));
-
-                    char line2[256];
-                    snprintf(line2, sizeof(line2), TR("大小: %zu KB", "Size: %zu KB"), g_slots[s].size / 1024);
-                    draw_text(framebuf, 140, item_y + 44, 15, line2, C_TEXT_MUTED);
-
-                    if (is_s_sel) {
-                        draw_text(framebuf, FB_WIDTH - 250, item_y + 26, 18, is_active ? TR("已是当前", "current") : TR("> 按 A 切换", "> press A to switch"), C_GREEN);
-                    }
-                    hot_add(120, item_y, FB_WIDTH - 240, 75, ACT_PICK_ITEM, s);   /* ★ v4 触屏点选槽位 */
-                    item_y += 85;
-                }
-
-                char page_info[64];
-                snprintf(page_info, sizeof(page_info), TR("共 %d 个存档槽位 (第 1 项为最近修改)", "%d save slots (#1 is most recent)"), g_num_slots);
-                draw_text(framebuf, 120, FB_HEIGHT - 80, 16, page_info, C_TEXT_MUTED);
-            }
-        }
-
-        /* (v5 已删除原「覆盖式画质页」死代码块 if (0 && g_gfx_show) {...} 共 56 行) */
-
-        /* ---------------- 模态弹窗 4：内置画质预设 (Y 键) ---------------- */
-        if (g_modal_mode == 4) {
-            gfx_card(framebuf, 80, 50, FB_WIDTH - 160, FB_HEIGHT - 100, C_MODAL_BG, 14);
-            
-            draw_text(framebuf, 120, 75, 24, TR("[画质设置] 导入外部配置 或 一键应用内置预设",
-                                     "[Graphics] Import external config or apply a builtin preset"), C_ACCENT);
-            draw_text(framebuf, 120, 110, 16, TR("上下键 选择 | A键 应用并保存 | B键 取消", "Up/Down select | A apply & save | B cancel"), C_TEXT_MUTED);
-
-            /* ★ 预设变多（6 套 + 导入 = 7 项），需要滚动：
-             *   弹窗可用高度 = FB_HEIGHT-100-145-40 ≈ 435；行高 62 ⇒ 可见 7 行
-             *   g_modal_scr = 滚动偏移，【专用于本弹窗与模态5】（模态3 不用它） */
-            int total = (int)NUM_GFX_PRESETS + 1;
-            int vis = 7;
-            int row_h = 62;
-            if (g_modal_sel < g_modal_scr) g_modal_scr = g_modal_sel;
-            if (g_modal_sel >= g_modal_scr + vis) g_modal_scr = g_modal_sel - vis + 1;
-            if (g_modal_scr > total - vis) g_modal_scr = total - vis;
-            if (g_modal_scr < 0) g_modal_scr = 0;
-
-            int item_y = 145;
-            for (int r = 0; r < vis; r++) {
-                int p = g_modal_scr + r;
-                if (p >= total) break;
-                int is_p_sel = (p == g_modal_sel);
-                const char *pname;
-                const char *pdesc;
-                if (p == 0) {
-                    pname = TR("从 /switch/gta5save/ 导入画质文件", "Import gfx file from /switch/gta5save/");
-                    pdesc = TR("扫描该目录所有 xml 画质文件供选择", "scans all xml gfx files there");
-                } else {
-                    pname = GFX_PRESETS[p - 1].name;
-                    pdesc = GFX_PRESETS[p - 1].desc;
-                }
-                gfx_card(framebuf, 120, item_y, FB_WIDTH - 240, row_h - 6,
-                         is_p_sel ? C_CARD_SEL : C_CARD, 8);
-                if (is_p_sel) gfx_accent_bar(framebuf, 124, item_y + 5, row_h - 16, C_ACCENT);
-
-                draw_text(framebuf, 140, item_y + 8, 21, pname, is_p_sel ? C_ACCENT : C_TEXT);
-                draw_text(framebuf, 140, item_y + 33, 15, pdesc, C_TEXT_MUTED);
-
-                if (is_p_sel) {
-                    draw_text(framebuf, FB_WIDTH - 250, item_y + 18, 18, TR("> 按 A 应用", "> press A to apply"), C_BORDER_SEL);
-                }
-                item_y += row_h;
-            }
-            if (total > vis) {
-                char pg[64];
-                snprintf(pg, sizeof(pg), TR("第 %d/%d 项 (上下滚动)", "item %d/%d (scroll)"), g_modal_sel + 1, total);
-                draw_text(framebuf, 120, item_y + 2, 14, pg, C_TEXT_MUTED);
-            }
-        }
-
-        /* ---------------- 模态弹窗 5：选择 /switch/gta5save/ 下的画质文件 ---------------- */
-        if (g_modal_mode == 5) {
-            gfx_card(framebuf, 80, 50, FB_WIDTH - 160, FB_HEIGHT - 100, C_MODAL_BG, 14);
-            
-            draw_text(framebuf, 120, 75, 24, TR("[导入画质文件] 选择要导入的文件", "[Import GFX] pick a file"), C_ACCENT);
-            draw_text(framebuf, 120, 110, 16, TR("上下键 选择 | A键 导入 | B键 返回", "Up/Down select | A import | B back"), C_TEXT_MUTED);
-
-            if (g_gfx_switch_count == 0) {
-                draw_text(framebuf, 140, 200, 20, TR("未在 /switch/gta5save/ 找到 xml 画质文件!", "No xml graphics files found in /switch/gta5save/!"), C_RED);
-            } else {
-                /* ★ 文件可能超过 6 个，必须滚动（行高 66，可见 6 行） */
-                int total5 = g_gfx_switch_count;
-                int vis5   = 6;
-                int row_h5 = 66;
-                if (g_modal_sel < g_modal_scr) g_modal_scr = g_modal_sel;
-                if (g_modal_sel >= g_modal_scr + vis5) g_modal_scr = g_modal_sel - vis5 + 1;
-                if (g_modal_scr > total5 - vis5) g_modal_scr = total5 - vis5;
-                if (g_modal_scr < 0) g_modal_scr = 0;
-
-                int item_y = 145;
-                for (int r = 0; r < vis5; r++) {
-                    int p = g_modal_scr + r;
-                    if (p >= total5) break;
-                    int is_p_sel = (p == g_modal_sel);
-                    gfx_card(framebuf, 120, item_y, FB_WIDTH - 240, 56, is_p_sel ? C_CARD_SEL : C_CARD, 8);
-                    if (is_p_sel) gfx_accent_bar(framebuf, 124, item_y + 5, 46, C_ACCENT);
-                    draw_text(framebuf, 140, item_y + 15, 22, g_gfx_switch_files[p], is_p_sel ? C_ACCENT : C_TEXT);
-                    if (is_p_sel) {
-                        draw_text(framebuf, FB_WIDTH - 250, item_y + 17, 18, TR("> 按 A 导入", "> press A to import"), C_BORDER_SEL);
-                    }
-                    item_y += row_h5;
-                }
-                if (total5 > vis5) {
-                    char pg5[64];
-                    snprintf(pg5, sizeof(pg5), TR("第 %d/%d 个文件 (上下滚动)", "file %d/%d (scroll)"), g_modal_sel + 1, total5);
-                    draw_text(framebuf, 120, item_y + 2, 14, pg5, C_TEXT_MUTED);
-                }
-            }
-        }
-
-        /* ---------------- 模态弹窗 6：画质路径自检结果 (画质页 X 键) ---------------- */
-        if (g_modal_mode == 6) {
-            gfx_card(framebuf, 80, 50, FB_WIDTH - 160, FB_HEIGHT - 100, C_MODAL_BG, 14);
-            
-            draw_text(framebuf, 120, 75, 24, TR("[画质路径自检] 各候选位置读写状态", "[GFX path self-test] read/write status"), C_ACCENT);
-            draw_text(framebuf, 120, 110, 16, TR("可读写=游戏可能读取 | 存在只读/不存在=不会读到 | B键 返回",
-                              "rw=game may read it | ro/missing=not read | B back"), C_TEXT_MUTED);
-
-            int iy = 145;
-            for (int p = 0; p < g_check_paths_count && p < 14; p++) {
-                int is_sel = (p == g_modal_sel);
-                gfx_card(framebuf, 120, iy, FB_WIDTH - 240, 44, is_sel ? C_CARD_SEL : C_CARD, 6);
-                if (is_sel) gfx_accent_bar(framebuf, 124, iy + 5, 34, C_ACCENT);
-                draw_text(framebuf, 140, iy + 11, 17,
-                          g_check_paths[p][0] ? g_check_paths[p] : TR("(空)", "(empty)"),
-                          strstr(g_check_paths[p], TR("可读写", "rw")) ? C_GREEN : C_TEXT_MUTED);
-                iy += 52;
-            }
-        }
-
-        /* ---------------- 模态弹窗 7：脚本管理（还原官方 + 内置模组） ----------------
-         * ★ v6.2：取代原来两个超长按钮「还原官方 error_listener / 还原官方 controller」
-         *   分区展示：上=还原官方（3 项），下=内置模组（4 项，署名原作者）。
-         *   每项按 A 都进弹窗 8 做二次确认。 */
-        if (g_modal_mode == MODE_SCRIPT_MGR || g_modal_mode == MODE_SCRIPT_CONFIRM) {
-            int ns = gc_script_stock_count();
-            int nm = gc_script_builtin_count();
-            int total = ns + nm;
-
-            gfx_card(framebuf, 56, 36, FB_WIDTH - 112, FB_HEIGHT - 72, C_MODAL_BG, 14);
-
-            draw_text(framebuf, 88, 56, 23,
-                      TR("[脚本管理] 还原官方脚本 / 内置模组一键安装",
-                         "[Script Manager] Restore stock / Install builtin mods"),
-                      C_ACCENT);
-            draw_text(framebuf, 88, 88, 14,
-                      TR("↑↓ 选择    A 执行（会二次确认）    B 返回",
-                         "Up/Down select    A apply (confirm twice)    B back"),
-                      C_TEXT_MUTED);
-
-            int card_x = 88, card_w = FB_WIDTH - 176;
-            int iy = 116;
-
-            /* --- 区一：还原官方 --- */
-            draw_text(framebuf, card_x, iy, 15,
-                      TR("[还原官方脚本] 用本工具内置的真·原版覆盖回去",
-                         "[Restore Stock] Overwrite with the bundled true originals"),
-                      C_BLUE);
-            iy += 22;
-            for (int i = 0; i < ns; i++) {
-                int sel = (g_modal_sel == i);
-                gfx_card(framebuf, card_x, iy, card_w, 48, sel ? C_CARD_SEL : C_CARD, 6);
-                if (sel) gfx_accent_bar(framebuf, card_x + 4, iy + 4, 40, C_ACCENT);
-                const char *sn = gc_script_stock_name(i);
-                draw_text(framebuf, card_x + 18, iy + 6, 17, sn ? sn : TR("(空)", "(empty)"),
-                          sel ? C_ACCENT : C_TEXT);
-                /* ★ v6.2: 修改器其实只借 achievement_controller 一个壳
-                 *   （ragemenu/achievement 的字节码里都不引用 shop_controller）
-                 *   ⇒ shop_controller 只有被旧版「三文件」装法改过的卡才需要用 */
-                draw_text(framebuf, card_x + 18, iy + 27, 11,
-                          (sn && strcmp(sn, "shop_controller.nsc") == 0)
-                              ? TR("官方原版（一般无需还原；仅被旧版「三文件」装法改过才用）",
-                                   "Stock original (usually no need; only for cards touched by the old 3-file install)")
-                              : TR("官方原版（RSC7 资源条目，非 mod 的裸条目）",
-                                   "Stock original (RSC7 resource entry, not a raw mod entry)"),
-                          C_TEXT_MUTED);
-                if (sel) draw_text_r(framebuf, card_x + card_w - 16, iy + 6, 14,
-                                     TR("A 还原", "A Restore"), C_ACCENT);
-                hot_add(card_x, iy, card_w, 48, ACT_SCRIPT_MGR, i);   /* param = 绝对行号 */
-                iy += 52;
-            }
-
-            /* --- 区二：内置模组 --- */
-            iy += 6;
-            draw_text(framebuf, card_x, iy, 15,
-                      TR("[内置模组] 已打进本工具，不用往卡里拷文件（原作者署名见下）",
-                         "[Builtin Mods] Bundled in this tool, no file copy needed (authors credited below)"),
-                      C_GREEN);
-            iy += 22;
-            for (int k = 0; k < nm; k++) {
-                int idx = ns + k;
-                int sel = (g_modal_sel == idx);
-                const GcBuiltinMod *m = gc_script_builtin(k);
-                gfx_card(framebuf, card_x, iy, card_w, 70, sel ? C_CARD_SEL : C_CARD, 6);
-                if (sel) gfx_accent_bar(framebuf, card_x + 4, iy + 4, 62, C_ACCENT);
-                draw_text(framebuf, card_x + 18, iy + 6, 17,
-                          MOD_TITLE(m) ? MOD_TITLE(m) : TR("(空)", "(empty)"), sel ? C_ACCENT : C_TEXT);
-                {
-                    char ab[200];
-                    snprintf(ab, sizeof(ab), TR("作者 %s   %d 个文件", "By %s   %d files"),
-                             (m && m->author) ? m->author : TR("未知", "?"), m ? m->n_files : 0);
-                    draw_text(framebuf, card_x + 18, iy + 28, 12, ab, C_TEXT_MUTED);
-                }
-                if (MOD_NOTE(m))
-                    draw_text(framebuf, card_x + 18, iy + 48, 11, MOD_NOTE(m), C_TEXT_MUTED);
-                if (sel) draw_text_r(framebuf, card_x + card_w - 16, iy + 6, 14,
-                                     TR("A 安装", "A Install"), C_ACCENT);
-                hot_add(card_x, iy, card_w, 70, ACT_SCRIPT_MGR, idx); /* param = 绝对行号 */
-                iy += 74;
-            }
-
-            draw_text(framebuf, card_x, FB_HEIGHT - 76, 12,
-                      TR("装模组会覆盖同名的官方脚本；想恢复点上面「还原官方脚本」。装完重启游戏生效。",
-                         "Installing a mod overwrites the stock script with the same name; use Restore Stock above to recover. Reboot the game after install."),
-                      C_TEXT_MUTED);
-            (void)total;
-        }
-
-        /* ---------------- 模态弹窗 8：操作二次确认 ----------------
-         * ★ v6.2：所有会覆盖 RPF 脚本的操作都要过这一关（用户要求）。 */
-        if (g_modal_mode == MODE_SCRIPT_CONFIRM) {
-            /* 上一步的脚本管理列表仍在下面渲染（条件里带了 MODE_SCRIPT_CONFIRM）
-             * ⇒ 确认框直接叠在列表中央，不用压暗整屏（RGB_A 无 alpha 混合）。 */
-            gfx_card(framebuf, FB_WIDTH / 2 - 360, 170, 720, 300, C_MODAL_BG, 14);
-            gfx_rect_outline(framebuf, FB_WIDTH / 2 - 360, 170, 720, 300, 3, C_BORDER_SEL);
-
-            if (g_mod_pending_kind == 0) {
-                const char *sn = gc_script_stock_name(g_mod_pending_idx);
-                draw_text_c(framebuf, FB_WIDTH / 2, 200, 22,
-                            TR("确认还原官方脚本 ?", "Restore stock script?"), C_ACCENT);
-                {
-                    char l1[200];
-                    snprintf(l1, sizeof(l1), "%s", sn ? sn : TR("(未知)", "(unknown)"));
-                    draw_text_c(framebuf, FB_WIDTH / 2, 250, 19, l1, C_TEXT);
-                }
-                draw_text_c(framebuf, FB_WIDTH / 2, 290, 15,
-                            TR("会用本工具内置的官方原版覆盖当前这一条",
-                               "This will overwrite the entry with the bundled stock original"),
-                            C_TEXT);
-                draw_text_c(framebuf, FB_WIDTH / 2, 318, 14,
-                            TR("（mod 借壳改过的就是这一条；发到卡上重启游戏后才生效）",
-                               "(The entry mods hijack; takes effect after rebooting the game)"),
-                            C_TEXT_MUTED);
-            } else {
-                const GcBuiltinMod *m = gc_script_builtin(g_mod_pending_idx);
-                draw_text_c(framebuf, FB_WIDTH / 2, 200, 22,
-                            TR("确认安装内置模组 ?", "Install builtin mod?"), C_GREEN);
-                draw_text_c(framebuf, FB_WIDTH / 2, 246, 19,
-                            MOD_TITLE(m) ? MOD_TITLE(m) : TR("(未知)", "(unknown)"), C_TEXT);
-                {
-                    char l2[300];
-                    snprintf(l2, sizeof(l2), TR("作者 %s", "By %s"),
-                             (m && m->author) ? m->author : TR("未知", "?"));
-                    draw_text_c(framebuf, FB_WIDTH / 2, 278, 14, l2, C_TEXT_MUTED);
-                    if (MOD_NOTE(m))
-                        draw_text_c(framebuf, FB_WIDTH / 2, 300, 12, MOD_NOTE(m), C_TEXT_MUTED);
-                }
-                draw_text_c(framebuf, FB_WIDTH / 2, 324, 15,
-                            TR("将写入下列 RPF 条目（同名会被覆盖）：",
-                               "Will write these RPF entries (same-name overwritten):"),
-                            C_TEXT);
-                if (m) {
-                    char fl[260]; int w = 0;
-                    for (int k = 0; k < m->n_files; k++) {
-                        const char *en = gc_script_builtin_entry(g_mod_pending_idx, k);
-                        w += snprintf(fl + w, sizeof(fl) - w, "%s%s",
-                                      k ? " / " : "", en ? en : "?");
-                        if (w >= (int)sizeof(fl) - 8) break;
-                    }
-                    draw_text_c(framebuf, FB_WIDTH / 2, 350, 12, fl, C_TEXT_MUTED);
-                }
-            }
-
-            /* 两个按钮（键盘 + 触屏都可用） */
-            {
-                int by2 = 390, bw2 = 190, bh2 = 46, gap = 30;
-                int bx1 = FB_WIDTH / 2 - bw2 - gap / 2;
-                int bx2 = FB_WIDTH / 2 + gap / 2;
-                int okp = tap_is_hot(bx1, by2, bw2, bh2);
-                int cnp = tap_is_hot(bx2, by2, bw2, bh2);
-                gfx_card(framebuf, bx1, by2, bw2, bh2, okp ? C_ACCENT : C_CARD_SEL, 6);
-                draw_text_c(framebuf, bx1 + bw2 / 2, by2 + 12, 18, TR("A 确认", "A Confirm"),
-                            okp ? 0xFFFFFFFFu : C_ACCENT);
-                hot_add(bx1, by2, bw2, bh2, ACT_SCRIPT_CONFIRM_OK, 0);
-                gfx_card(framebuf, bx2, by2, bw2, bh2, cnp ? C_CARD_SEL : C_HEADER, 6);
-                draw_text_c(framebuf, bx2 + bw2 / 2, by2 + 12, 18, TR("B 取消", "B Cancel"),
-                            cnp ? C_ACCENT : C_TEXT);
-                hot_add(bx2, by2, bw2, bh2, ACT_BACK, 0);
-            }
-        }
-
-        /* =====================================================================
-         * ★★ v24 触屏点击反馈（用户反馈「选中按钮没有高亮显示」）
-         *   点中热区后，在【刚被点的那个矩形】上叠一层醒目高亮：
-         *   前 40% 时间 = 4px 纯白外框 + 左侧白粗条（最强调，绝不会看漏）
-         *   之后      = 2px 金框，420ms 后自动消失。
-         *   画在所有页面内容之上、toast 之下。
-         * ===================================================================== */
         if (g_tap_fx_on) {
             u64 el = (svcGetSystemTick() - g_tap_fx_tick) * 1000 / 19200000ULL;
             if (el >= TAP_FX_MS) {
                 g_tap_fx_on = 0;
             } else {
-                int early = (el < TAP_FX_MS * 2 / 5);
-                uint32_t tc = early ? 0xFFFFFFFFu : C_BORDER_SEL;
-                int th = early ? 4 : 2;
-                int fx = g_tap_fx[0] - 2, fy = g_tap_fx[1] - 2;
-                int fw = g_tap_fx[2] + 4, fh = g_tap_fx[3] + 4;
-                gfx_rect_outline(framebuf, fx, fy, fw, fh, th, tc);
-                if (early) gfx_rect(framebuf, fx, fy, 7, fh, tc);   /* 左侧粗条 */
+                gfx_rect_outline(framebuf,g_tap_fx[0],g_tap_fx[1],g_tap_fx[2],g_tap_fx[3],2,C_ACCENT);
             }
         }
 
         /* 屏幕中央提示框 (保存成功等, 绘制在最上层) */
-        draw_toast(framebuf);
+        if(!g_modal_mode && !g_gc_confirm && !g_dlc_confirm && !ui_report_active())draw_toast(framebuf);
 
         framebufferEnd(&fb);
     }

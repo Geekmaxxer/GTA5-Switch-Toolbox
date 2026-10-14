@@ -5,6 +5,36 @@ DLC management, script MOD install/restore, graphics presets and builtin mods, a
 
 English | [中文](README.md)
 
+## UI refinement
+
+All five tabs and dialogs use a shared layout. D-pad or either stick navigates;
+A activates and B returns. L/R changes tabs. Press Minus (-) to focus the action
+bar, then Left/Right chooses a button and A runs it. B returns to the list.
+In Graphics and Perf, Left/Right adjusts the selected value. Tools now has a
+controller-selectable grid; touch remains supported. **Switch Joy-Con and touch UI testing passed.**
+
+## Self Radio and radio imports
+
+The original five tabs and controls are retained. In **Tools**, press **X** for
+Self Radio NX or **Y** for Radio Imports; the two new cards also support touch.
+Copy prepared package folders to `/switch/gta5save/packages/`. Select a package:
+**A** installs, **X** restores its backup, **Y** recovers an interrupted update,
+and **B** returns. Close GTA before changing its files.
+
+Self Radio installs its archive patches and runtime without downloading a full
+`update.rpf`. Put music in the game's `romfs/User Music` folder. This package is
+for game build `6e3e9b3af5746e74b615bd981080c9271bc226620`.
+
+Radio Imports installs a matching station RPF and timing RPF together. Prepare
+both using GTA Radio Editor on a PC; this NRO does not encode music into AWC.
+Conflicting edits are refused. Original files are kept under
+`/switch/gta5save/packages/.backups/`; allow extra SD space for a staged copy of
+each affected archive. Restore is available only for files this installer backed up.
+
+Scripts now check payload bounds and embedded names before writing. Structural
+validation does not prove native compatibility or in-game behavior.
+**New package install/restore/recovery still needs Switch acceptance.**
+
 ## ⚠️ Read this first: back up update.rpf AND update2.rpf
 
 **A backup is strongly recommended.** Any RPF write (mod install / uninstall /

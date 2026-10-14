@@ -16,6 +16,7 @@
 #include "gc_key_container.h"     /* ★ key → 正确容器路径 映射 */
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdarg.h>
 #include <dirent.h>
 #include <errno.h>
