@@ -916,23 +916,9 @@ int gc_script_restore_stock(const char *entry_name, char *err, size_t errsz) {
 /* ========================================================================= */
 /* ★ v6.2: 内置模组 —— 打进 NRO romfs，一键安装，免插卡拷文件                 */
 /* ========================================================================= */
-/* ★★ 2026-10-01 晚【重要更正】：ragemenu 只需要【一个壳】！
- *
- *   ragemenu.nsc              本体（新建条目）
- *   achievement_controller.nsc 借壳加载器（字节码里含 joaat("ragemenu")=0x4BD26EEF ×4）
- *
- *   ❌ 早先照抄 MEGATARD 的 `how to install.txt`（它列了 3 个文件，含
- *      shop_controller.nsc），把 shop_controller 也打进内置包 —— **多余**。
- *      实证（用户指出 + 字节码复核）：
- *        ① ragemenu.nsc / achievement_controller.nsc 的 payload 里
- *           **完全没有 joaat("shop_controller")=0x39DA738B 的引用**
- *        ② 用户实际装机用的 `GTA5switch修改器版本0.9.9开菜单 L+↓.zip`
- *           里**只有 achievement_controller.nsc + ragemenu.nsc 两个文件**
- *        ③ 作者仓库里那份 shop_controller.nsc（2,129,920 B）躺在
- *           `MEGATARD_nsc/_stock_ref/` 里 —— 那是**给 SC-CL 做 PC→Switch
- *           转换时当"同版本 stock 参考"用的**（拷头 8 字节 / 0x18 处 4 字节），
- *           **不是要装进游戏的**。且它与官方解压出的 payload 内容并不相同。
- *      ⇒ 装模组只写 2 个条目。NRO 体积因此省下 2.03 MB。
+/* MEGATARD v1.0.5 bundles the author's current three-file deployment:
+ * ragemenu.nsc, achievement_controller.nsc and shop_controller.nsc.
+ * Classic ragemenu retains its original two-file bundle.
  *
  * HotCoffee-NX 也是【一对】文件，但★有 cinnamon / combo 两个版本★：
  *   error_listener.nsc         加载器（含 joaat("simple_zombies")×4）
@@ -950,6 +936,7 @@ typedef struct { const char *entry; const char *src; } GcModFile;
 static const GcModFile MF_MEGATARD[] = {
     { "ragemenu.nsc",               "romfs:/builtin_mods/megatard/ragemenu.nsc" },
     { "achievement_controller.nsc", "romfs:/builtin_mods/megatard/achievement_controller.nsc" },
+    { "shop_controller.nsc",        "romfs:/builtin_mods/megatard/shop_controller.nsc" },
 };
 static const GcModFile MF_CLASSIC[] = {
     { "ragemenu.nsc",               "romfs:/builtin_mods/classic/ragemenu.nsc" },
@@ -980,7 +967,7 @@ typedef struct {
 } GcBuiltinModDef;
 
 static const GcBuiltinModDef S_MODS[] = {
-    { "megatard",  "MEGATARD v0.9.9 汉化", "MEGATARD v0.9.9 (ZH)", "Geekmaxxer",
+    { "megatard",  "MEGATARD v1.0.5", "MEGATARD v1.0.5", "MEGATARD",
       "与「经典 ragemenu」互斥（都占 ragemenu）",
       "Mutually exclusive with Classic ragemenu (both use the ragemenu slot)",
       MF_MEGATARD,  MF_N(MF_MEGATARD) },
