@@ -87,8 +87,7 @@ auto-detected.
 **Restore stock**: in Mod Mgr, pick a stock script (error_listener /
 achievement_controller / shop_controller) and restore it individually.
 
-**In-game mod menu hotkeys**: after installing, press **L + D-pad Down** (MEGATARD/ragemenu)
-or **B + D-pad Right** (Hot Coffee) in game.
+**In-game mod menu hotkeys**: after installing, press **L + D-pad Down** (MEGATARD) or **RB + B** (ragemenu) or **B + D-pad Right** (Hot Coffee) in game.
 
 ### DLC tab
 
